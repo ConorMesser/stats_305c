@@ -3,7 +3,7 @@ import time
 import pandas as pd
 
 
-def fetch_monomer_physicochemical_properties(limit_pages=None):
+def fetch_monomer_physicochemical_properties(limit_pages=None, size=100):
     base_url = "https://dbaasp.org"
     peptides_url = f"{base_url}/peptides"
 
@@ -15,7 +15,7 @@ def fetch_monomer_physicochemical_properties(limit_pages=None):
 
     # Pagination variables
     page = 0
-    size = 100  # Number of peptides per page
+    # size: Number of peptides per page (default 100)
     has_more = True
 
     print("Starting download of monomer peptides...")
@@ -49,6 +49,9 @@ def fetch_monomer_physicochemical_properties(limit_pages=None):
         # 2. Iterate through the page's items and fetch the full PeptideView for each
         for item in items:
             peptide_id = item.get("id")
+            sequence = item.get("sequence")
+            c_term = item.get("cTerminus")
+            n_term = item.get("nTerminus")
             if not peptide_id:
                 continue
 
@@ -63,6 +66,9 @@ def fetch_monomer_physicochemical_properties(limit_pages=None):
                 phys_props = peptide_view.get("physicoChemicalProperties")
                 if phys_props:
                     properties_by_id[peptide_id] = phys_props
+                    properties_by_id[peptide_id].append({'name': "sequence", 'value': sequence})
+                    properties_by_id[peptide_id].append({'name': 'c_terminus', 'value': c_term})
+                    properties_by_id[peptide_id].append({'name': 'n_terminus', 'value': n_term})
 
                 # TODO extract other data
                 # inter/intra chain bonds?
@@ -71,8 +77,8 @@ def fetch_monomer_physicochemical_properties(limit_pages=None):
                 #antibiofilmActivities
                 #hemoliticCytotoxicActivities
 
-            # Brief pause to respect API rate limits
-            time.sleep(0.05)
+            # Brief pause to respect 6API rate limits
+            time.sleep(0.07)
 
         # 3. Check if there are more pages
         if isinstance(data, dict):
@@ -93,7 +99,7 @@ def fetch_monomer_physicochemical_properties(limit_pages=None):
 
     # The API returns all values as strings (e.g., '1.97', '5.00').
     # This line safely converts columns containing numbers into actual float/int data types.
-    num_cols = df.columns[1:]
+    num_cols = df.columns[1:-3]
     df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
 
     return df
@@ -102,11 +108,11 @@ def fetch_monomer_physicochemical_properties(limit_pages=None):
 if __name__ == "__main__":
     # Remove `limit_pages=1` to scrape the entire database (this will take time!)
     # We are using limit_pages=1 here just to test the first 100.
-    monomer_data = fetch_monomer_physicochemical_properties(limit_pages=40)
+    monomer_data = fetch_monomer_physicochemical_properties()
 
     print(f"\nSuccessfully fetched properties for {len(monomer_data)} peptides.")
 
-    monomer_data.to_csv('./subset_chem_phys_features.txt',sep='\t')
+    monomer_data.to_csv('./all_chem_phys_features.txt',sep='\t')
 
     # Print an example of the first fetched peptide
     if monomer_data is not None:

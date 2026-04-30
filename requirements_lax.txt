@@ -1,0 +1,9 @@
+numpy>=2.4.4
+pandas>=3.0.2
+pymc>=4.0.0
+scikit-learn>=1.8.0
+scipy>=1.17.1
+seaborn>=0.13.2
+matplotlib>=3.10.8
+jupyter_core>=5.9.1
+biopython>=1.87

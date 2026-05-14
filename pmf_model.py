@@ -1,3 +1,13 @@
+import pandas as pd
+import pathlib
+import matplotlib.pyplot as plt
+import os
+import arviz as az
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import xarray as xr
+import scipy.stats as stats
+
 import pymc as pm
 import pytensor.tensor as pt
 import numpy as np
@@ -240,7 +250,8 @@ class Hybrid_PMF:
                 # 2. Calculate interaction term using batched dot product along the K dimension
                 interaction = (U_obs * V_obs).sum(axis=-1)
             else:
-                interaction = pt.zeros(len(pep_idx_))
+                # Use pep_idx_.shape[0] to get the size of the tensor
+                interaction = pt.zeros(pep_idx_.shape[0])
 
             # 3. Build the predicted mean
             mu_obs = alpha_peptide[pep_idx_] + beta_species[spec_idx_] + interaction #+ global_mu
@@ -347,7 +358,7 @@ class Hybrid_PMF:
         axs[1][1].set_title(label=r"$\|V\|_{Fro}^2$ at Each Sample", fontsize=10)
         axs[1][1].set_xlabel("Sample Number", fontsize=10)
 
-    def plot_intercept_traces(self, species_list=None, peptide_list=None):
+    def plot_intercept_traces(self, species_list=None, peptide_list=None, **kwargs):
         """
         Plot the traces for the global mean and specific intercepts.
 
@@ -373,11 +384,10 @@ class Hybrid_PMF:
         var_names.append("beta_sigma_species")
 
         # Plot using ArviZ
-        az.plot_trace(idata, var_names=var_names, coords=coords, figsize=(12, 3 * len(var_names)))
+        az.plot_trace(idata, var_names=var_names, coords=coords, figsize=(12, 3 * len(var_names)), **kwargs)
         plt.tight_layout()
-        plt.show()
 
-    def plot_mic_posterior(self, peptide_id, species_id, true_mic=None):
+    def plot_mic_posterior(self, peptide_id, species_id, true_mic=None, **kwargs):
         """
         Reconstruct and plot the posterior distribution of the expected log(MIC)
         for a specific peptide and species.
@@ -414,20 +424,20 @@ class Hybrid_PMF:
             mu_posterior,
             ref_val=true_mic,
             point_estimate="mean",
-            hdi_prob=0.95
+            hdi_prob=0.95,
+            **kwargs
         )
         ax.set_title(f"Expected log(MIC)\n{peptide_id} vs {species_id}")
-        plt.show()
 
         # Return the raw xarray DataArray in case you want to do math with it later
-        return mu_posterior
+        return mu_posterior, ax
 
-    def plot_feature_weights(self):
+    def plot_feature_weights(self, **kwargs):
         """Plot a forest plot of the physical feature weights (w0_pc)."""
         idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
 
         # Get the original column names from your dataframe
-        feature_names = self.pc_df.columns[1:13].tolist()
+        feature_names = self.pc_df.columns[:12].tolist()
 
         # Create the forest plot
         axes = az.plot_forest(
@@ -435,11 +445,13 @@ class Hybrid_PMF:
             var_names=["w0_pc"],
             combined=True,
             hdi_prob=0.95,
-            figsize=(8, 6)
+            figsize=(8, 6),
+            **kwargs
         )
 
         # Relabel the y-axis with the actual feature names
         axes[0].set_yticklabels(feature_names[::-1]) # Reversed because ArviZ plots bottom-to-top
-        axes[0].set_title("Posterior Weights of Physical Features (General Potency)")
+        axes[0].set_title("Posterior Weights of Physical Features (95% HDI)")
         plt.axvline(0, color='red', linestyle='--', alpha=0.5)
-        plt.show()
+
+        return axes

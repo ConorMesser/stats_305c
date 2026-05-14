@@ -7,19 +7,11 @@ from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import xarray as xr
 import scipy.stats as stats
-
 import pymc as pm
 import pytensor.tensor as pt
 import numpy as np
 import logging
-import pandas as pd
-import pathlib
-import matplotlib.pyplot as plt
-import os
-import arviz as az
-from sklearn.preprocessing import StandardScaler
-import pandas as pd
-import xarray as xr
+
 
 logging.basicConfig(level=logging.INFO)
 SEED = 42
@@ -83,31 +75,76 @@ def split_holdout_peptides(long_df, holdout_frac=0.20, random_state=42):
           f"  test peptides={test_df['Peptide ID'].nunique()}  ({len(test_df)} obs)")
     return train_df, test_df
 
-class Hybrid_PMF:
+
+class Hybrid_PMF_dev:
     """Hybrid Probabilistic Matrix Factorization model for MIC prediction."""
 
-    def __init__(self, obs_df, pc_df, esm_df, species_to_genus_idx, dim=10,
+    def __init__(self, obs_df, pc_df, esm_df, tax_df, dim=10,
                  horseshoe=True, include_esm=True, non_centered=False,
-                 linreg=False):
+                 linreg=False, hierarchical=False, anchor_pc=False):
         """
         :param obs_df: DataFrame with ['Peptide ID', 'Target Species', 'mic']
                        (Uses LONG format)
         :param pc_df: pd.DataFrame shape (N_peptides, 12)
         :param esm_df: pd.DataFrame shape (N_peptides, 1280)
-        :param species_to_genus_idx: 1D array mapping species_id -> genus_id
+        :param tax_df: pd.DataFrame with ['strain', 'species', 'genus',...]
         :param dim: Latent factors (K)
         """
         self.name = "Hybrid_PMF"
         self.dim = dim
 
         # Clean Data
-        species_dict = {species: idx for idx, species in enumerate(obs_df['Target Species'].unique())}
+        strain_dict = {strain: idx for idx, strain in enumerate(obs_df['Target Species'].unique())}
         peptide_dict = {peptide: idx for idx, peptide in enumerate(obs_df['Peptide ID'].unique())}
-        self.species_dict = species_dict
+        self.strain_dict = strain_dict
         self.peptide_dict = peptide_dict
 
-        obs_df['species_idx'] = obs_df['Target Species'].map(species_dict)
+        obs_df['strain_idx'] = obs_df['Target Species'].map(strain_dict)
         obs_df['peptide_idx'] = obs_df['Peptide ID'].map(peptide_dict)
+
+        species_dict = {species: idx for idx, species in enumerate(tax_df['species'].unique())}
+        genus_dict = {genus: idx for idx, genus in enumerate(tax_df['genus'].unique())}
+        self.species_dict = species_dict
+        self.genus_dict = genus_dict
+
+        # Generate species_to_genus and strain_to_species from taxonomy_df
+        # 1. Define all ranks in order (lowest to highest)
+        ranks = ['strain', 'species', 'genus']
+
+        # 2. Generate string-to-idx dictionaries for ALL ranks
+        # We drop NaNs first so missing values aren't accidentally assigned an integer ID
+        id_dicts = {'strain': strain_dict,
+                    'species': species_dict,
+                    'genus': genus_dict}
+        # for rank in ranks:
+        #     if rank in tax_df.columns:
+        #         id_dicts[rank] = {name: idx for idx, name in enumerate(tax_df[rank].dropna().unique())}
+
+        # # Extract them to explicit variables to match your naming convention
+        # species_dict = id_dicts.get('species', {})
+        # genus_dict = id_dicts.get('genus', {})
+        # id_dicts['strain'] = strain_dict
+
+        # 3. Create an index-only dataframe by replacing strings with their IDs
+        tax_idx_df = tax_df.copy()
+        for rank in ranks:
+            if rank in tax_idx_df.columns and rank in id_dicts:
+                # .map() is orders of magnitude faster than .replace()
+                tax_idx_df[rank] = tax_idx_df[rank].map(id_dicts[rank])
+
+        # 4. Generate the hierarchical mapping dictionaries (Child_ID -> Parent_ID)
+        hierarchies = {}
+        for i in range(len(ranks) - 1):
+            child = ranks[i]
+            parent = ranks[i+1]
+            
+            if child in tax_idx_df.columns and parent in tax_idx_df.columns:
+                # Drop duplicates and NaNs to ensure a clean 1-to-1 or Many-to-1 mapping
+                mapping = tax_idx_df[[child, parent]].dropna().drop_duplicates().astype(int)
+                
+                # Convert to dictionary: {child_idx: parent_idx}
+                dict_name = f"{child}_to_{parent}_idx"
+                hierarchies[dict_name] = mapping.set_index(child)[parent].to_dict()
 
         pc_df['original_idx'] = pc_df.index
         esm_df['original_idx'] = esm_df.index
@@ -118,7 +155,7 @@ class Hybrid_PMF:
 
         # Extract Data
         obs_peptide_idx = obs_df['peptide_idx'].values
-        obs_species_idx = obs_df['species_idx'].values
+        obs_strain_idx = obs_df['strain_idx'].values
         obs_mic = obs_df['mic'].values
         # Get the unique integer indices (0 to n_peptides-1) in order
         unique_pep_idx = np.sort(np.unique(obs_peptide_idx))
@@ -129,9 +166,20 @@ class Hybrid_PMF:
         esm_input = esm_df.loc[unique_pep_idx].iloc[:, :-1].values
 
         n_peptides = len(np.unique(obs_peptide_idx))
-        n_species = len(np.unique(obs_species_idx))
-        n_genera = len(np.unique(species_to_genus_idx))
+        n_strains = len(np.unique(obs_strain_idx))
+        n_species = len(species_dict)
+        n_genera = len(genus_dict)
         n_obs = len(obs_mic)
+
+        # Create an array of length n_species
+        species_to_genus_idx = np.zeros(n_species, dtype=int)
+        for child_idx, parent_idx in hierarchies['species_to_genus_idx'].items():
+            species_to_genus_idx[child_idx] = parent_idx
+
+        # Create an array of length n_strains
+        strain_to_species_idx = np.zeros(n_strains, dtype=int)
+        for child_idx, parent_idx in hierarchies['strain_to_species_idx'].items():
+            strain_to_species_idx[child_idx] = parent_idx
 
         self.idata = None
         self.idata_vi = None
@@ -141,6 +189,7 @@ class Hybrid_PMF:
         with pm.Model(
                 coords={
                     "peptide": range(n_peptides),
+                    "strain": range(n_strains),
                     "species": range(n_species),
                     "genus": range(n_genera),
                     "latent_factor": range(dim),
@@ -151,17 +200,31 @@ class Hybrid_PMF:
         ) as pmf:
             # --- DATA CONTAINERS ---
             pep_idx_ = pm.Data("pep_idx", obs_peptide_idx, dims="obs_id")
-            spec_idx_ = pm.Data("spec_idx", obs_species_idx, dims="obs_id")
-            mic_ = pm.Data("mic", obs_mic, dims="obs_id")
+            strain_idx_ = pm.Data("strain_idx", obs_strain_idx, dims="obs_id")
+            spec_idx_ = pm.Data("spec_idx", strain_to_species_idx, dims="strain")
+            genus_idx_ = pm.Data("genus_idx", species_to_genus_idx, dims="species")
+            mic_ = pm.Data("mic", obs_mic, dims="obs_id").astype(np.float32)
 
-            X_pc = pm.Data("X_pc", pc_input, dims=("peptide", "phys_chem"))
-            X_esm = pm.Data("X_esm", esm_input, dims=("peptide", "esm"))
+            X_pc = pm.Data("X_pc", pc_input, dims=("peptide", "phys_chem")).astype(np.float32)
+            X_esm = pm.Data("X_esm", esm_input, dims=("peptide", "esm")).astype(np.float32)
 
             if not linreg:
 
                 # --- HYBRID PEPTIDE MAPPING (u_i) ---
                 # 1. Physical Features (Standard Weakly Informative Prior)
+                # 1. Sample the unconstrained bulk of the weights
                 B_pc = pm.Normal("B_pc", mu=0, sigma=1, dims=("phys_chem", "latent_factor"))
+
+                if anchor_pc and dim <= 12:
+                    # 2. Sample K positive anchors
+                    B_pc_anchors = pm.HalfNormal("B_pc_anchors", sigma=1, shape=dim)
+
+                    # 3. Stitch them together using PyTensor
+                    # This replaces the diagonal of the top KxK block of B_pc with strictly positive values.
+                    B_pc = pt.set_subtensor(
+                        B_pc[np.arange(dim), np.arange(dim)], 
+                        B_pc_anchors
+                    )
 
                 if include_esm:
                     if horseshoe:
@@ -187,48 +250,65 @@ class Hybrid_PMF:
                 else:
                     U = pm.Deterministic("U", pt.dot(X_pc, B_pc), dims=("peptide", "latent_factor"))
 
-                # --- TAXONOMIC HIERARCHY (v_j) ---  TODO - add back?
-                # Genus-level baseline factors
-                # V_genus = pm.Normal("V_genus", mu=0, sigma=1, dims=("genus", "latent_factor"))
-                # Species-level factors (Centered on their Genus)
+                # --- TAXONOMIC HIERARCHY (v_j) ---
                 # sigma_species = pm.HalfNormal("sigma_species",
                 #                               sigma=1) #, dims=("latent_factor")) # shape D or 1?
-
-                # if non_centered:
-                #     # --- NON-CENTERED LATENT VECTORS ---
-                #     V_species_raw = pm.Normal("V_species_raw", mu=0, sigma=1, dims=("species", "latent_factor"))
-                #     # Broadcasting the scale across the latent dimensions
-                #     V_species = pm.Deterministic("V_species", V_species_raw * sigma_species, dims=("species", "latent_factor"))
-                # else:
-                #     V_species = pm.Normal(
-                #         "V_species",
-                #         mu=0,  # V_genus[species_to_genus_idx],
-                #         sigma=sigma_species,
-                #         dims=("species", "latent_factor")
-                #     )
+                if hierarchical:
+                    V_genus = pm.Normal("V_genus", mu=0, sigma=1, dims=("genus", "latent_factor"))   # Make ZeroSumNormal?
+                    if non_centered:
+                        V_species_raw = pm.Normal("V_species_raw", mu=0, 
+                                            sigma=1, dims=("species", "latent_factor"))
+                        V_species = pm.Deterministic("V_species", V_genus[genus_idx_] + V_species_raw, 
+                                             dims=("species", "latent_factor"))
+                    else:
+                        V_species = pm.Normal("V_species", mu=V_genus[genus_idx_], 
+                                            sigma=1, dims=("species", "latent_factor"))
+                    V_mu = V_species[spec_idx_]
+                else:
+                    V_mu = 0           
 
                 #### hard coded sigma to avoid correlation with learned variance in U ####
-                V_species = pm.Normal("V_species", mu=0, sigma=1, dims=("species", "latent_factor"))
-
+                if non_centered:
+                    V_strains_raw = pm.Normal("V_strains_raw", mu=0, 
+                                        sigma=1, dims=("strain", "latent_factor"))
+                    V_strains = pm.Deterministic("V_strains", V_mu + V_strains_raw, 
+                                         dims=("strain", "latent_factor"))
+                else:
+                    V_strains = pm.Normal("V_strains", mu=V_mu, 
+                                        sigma=1, dims=("strain", "latent_factor"))
 
             # --- INTERCEPTS ---
             ## global_mu removed to avoid centering issue (where sampler can add to mu and subtract elsewhere)
             ## required that I subtract the mean from the dataset before inputting
-            # data_mean = np.mean(obs_mic)
-            # global_mu = pm.Normal("global_mu", mu=data_mean, sigma=5, initval=data_mean)
 
-            # Species Intercept (Hierarchical Intrinsic Resistance)  TODO - make hierarchical?
-            # beta_genus = pm.Normal("beta_genus", mu=0, sigma=1, dims="genus")
-            beta_sigma_species = pm.HalfNormal("beta_sigma_species", sigma=1)
+            # Strain Intercept (Hierarchical Intrinsic Resistance)
+            beta_strain_sigma = pm.HalfNormal("beta_strain_sigma", sigma=1)
+
+            if hierarchical:
+                beta_genus = pm.ZeroSumNormal("beta_genus", sigma=1, dims="genus")
+                if non_centered:
+                    beta_species_raw = pm.Normal("beta_species_raw", mu=0, 
+                                     sigma=1, dims="species")
+                    beta_species = pm.Deterministic("beta_species", beta_genus[genus_idx_] + beta_species_raw, dims="species")
+                else:
+                    beta_species = pm.Normal("beta_species", mu=beta_genus[genus_idx_], 
+                                              sigma=1, dims="species")
+                beta_mu = beta_species[spec_idx_]
+            else:
+                beta_mu = 0            
+            
             if non_centered:
                 # 1. Sample raw from a standard normal
-                beta_species_raw = pm.Normal("beta_species_raw", mu=0, sigma=1, dims="species")
+                beta_strain_raw = pm.Normal("beta_strain_raw", mu=0, sigma=1, dims="strain")
                 # 2. Scale it deterministically
-                beta_species = pm.Deterministic("beta_species", beta_species_raw * beta_sigma_species, dims="species")
+                beta_strain = pm.Deterministic("beta_strain", beta_mu + beta_strain_raw * beta_strain_sigma, dims="strain")
+            elif hierarchical:
+                beta_strain = pm.Normal("beta_strain", mu=beta_mu,
+                                        dims="strain", sigma=beta_strain_sigma)   
             else:
-                beta_species = pm.ZeroSumNormal("beta_species",
-                                        #mu=0,  #beta_genus[species_to_genus_idx],
-                                        dims="species", sigma=beta_sigma_species)
+                beta_strain = pm.ZeroSumNormal("beta_strain",
+                                        dims="strain", sigma=beta_strain_sigma)
+                
 
             # Peptide Intercept (Cold-start friendly mapping)
             w0_pc = pm.Normal("w0_pc", mu=0, sigma=1, dims="phys_chem")
@@ -245,16 +325,16 @@ class Hybrid_PMF:
             if not linreg:
                 # 1. Gather the relevant parameters for the observed data points
                 U_obs = U[pep_idx_]  # Shape (N_obs, K)
-                V_obs = V_species[spec_idx_]  # Shape (N_obs, K)
+                V_obs = V_strains[strain_idx_]  # Shape (N_obs, K)
 
                 # 2. Calculate interaction term using batched dot product along the K dimension
-                interaction = (U_obs * V_obs).sum(axis=-1)
+                interaction = pt.batched_dot(U_obs, V_obs)
             else:
                 # Use pep_idx_.shape[0] to get the size of the tensor
                 interaction = pt.zeros(pep_idx_.shape[0])
 
             # 3. Build the predicted mean
-            mu_obs = alpha_peptide[pep_idx_] + beta_species[spec_idx_] + interaction #+ global_mu
+            mu_obs = alpha_peptide[pep_idx_] + beta_strain[strain_idx_] + interaction #+ global_mu
 
             # 4. Observation Noise
             sigma_obs = pm.HalfNormal("sigma_obs", sigma=1)
@@ -268,7 +348,15 @@ class Hybrid_PMF:
     # Draw MCMC samples.
     def draw_samples(self, **kwargs):
         with self.model:
-            self.idata = pm.sample(**kwargs)
+            if 'chains' in kwargs and kwargs['chains'] > 1 and \
+                'nuts_sampler' in kwargs and kwargs['nuts_sampler'] == 'numpyro':
+                    self.idata = sample_numpyro_nuts(
+                                  **kwargs,
+                                  chain_method="vectorized", # Guaranteed to use vmap
+                                  keep_untransformed=False
+                              )
+            else:
+                self.idata = pm.sample(**kwargs)
         return self.idata
 
     def var_inference(self, **kwargs):
@@ -298,14 +386,14 @@ class Hybrid_PMF:
         esm_input = esm_df_predict.set_index('original_idx').loc[predict_peps]
 
         # Ensure all target species exist in the training dictionary
-        assert len(set(new_long_df["Target Species"]) - set(self.species_dict.keys())) == 0, \
+        assert len(set(new_long_df["Target Species"]) - set(self.strain_dict.keys())) == 0, \
             "Cannot predict for a species not in the training set!"
 
         with self.model:
             pm.set_data(
                 {
                     "pep_idx":  obs_peptide_idx,
-                    "spec_idx": new_long_df["Target Species"].map(self.species_dict).values,
+                    "spec_idx": new_long_df["Target Species"].map(self.strain_dict).values,
                     "mic":      np.ones(len(new_long_df)), # Dummy values for shape
                     "X_pc":     pc_input.values,
                     "X_esm":    esm_input.values,
@@ -344,8 +432,8 @@ class Hybrid_PMF:
         )
         norms["V"] = xr.apply_ufunc(
             np.linalg.norm,
-            idata.posterior["V_species"],
-            input_core_dims=[["species", "latent_factor"]],
+            idata.posterior["V_strains"],
+            input_core_dims=[["strain", "latent_factor"]],
             kwargs={"ord": "fro", "axis": (-2, -1)},
         )
         return xr.Dataset(norms)
@@ -374,7 +462,7 @@ class Hybrid_PMF:
         if species_list is not None:
             var_names.append("beta_species")
             # Convert string names to the integer indices used in the model
-            coords["species"] = [self.species_dict[s] for s in species_list]
+            coords["species"] = [self.strain_dict[s] for s in species_list]
 
         if peptide_list is not None:
             var_names.append("alpha_peptide")
@@ -387,13 +475,13 @@ class Hybrid_PMF:
         az.plot_trace(idata, var_names=var_names, coords=coords, figsize=(12, 3 * len(var_names)), **kwargs)
         plt.tight_layout()
 
-    def plot_mic_posterior(self, peptide_id, species_id, true_mic=None, **kwargs):
+    def plot_mic_posterior(self, peptide_id, strains_id, true_mic=None, **kwargs):
         """
         Reconstruct and plot the posterior distribution of the expected log(MIC)
-        for a specific peptide and species.
+        for a specific peptide and strain.
 
         :param peptide_id: String ID of the peptide.
-        :param species_id: String ID of the target species.
+        :param strains_id: String ID of the target strain.
         :param true_mic: Optional float (in log space) to plot as a reference line.
         """
         idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
@@ -402,15 +490,15 @@ class Hybrid_PMF:
         # Look up the internal integer indices
         try:
             p_idx = self.peptide_dict[peptide_id]
-            s_idx = self.species_dict[species_id]
+            s_idx = self.strain_dict[strains_id]
         except KeyError as e:
             raise ValueError(f"ID {e} not found in the training dictionary.")
 
         # 1. Extract the specific slices for this pair
         alpha = post["alpha_peptide"].sel(peptide=p_idx)
-        beta = post["beta_species"].sel(species=s_idx)
+        beta = post["beta_strain"].sel(strain=s_idx)
         u_vec = post["U"].sel(peptide=p_idx)
-        v_vec = post["V_species"].sel(species=s_idx)
+        v_vec = post["V_strains"].sel(strain=s_idx)
 
         # 2. Calculate the dot product across the latent factor dimension
         # xarray automatically handles broadcasting across chains and draws
@@ -427,7 +515,7 @@ class Hybrid_PMF:
             hdi_prob=0.95,
             **kwargs
         )
-        ax.set_title(f"Expected log(MIC)\n{peptide_id} vs {species_id}")
+        ax.set_title(f"Expected log(MIC)\n{peptide_id} vs {strains_id}")
 
         # Return the raw xarray DataArray in case you want to do math with it later
         return mu_posterior, ax
@@ -455,3 +543,4 @@ class Hybrid_PMF:
         plt.axvline(0, color='red', linestyle='--', alpha=0.5)
 
         return axes
+    

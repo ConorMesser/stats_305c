@@ -76,7 +76,7 @@ def split_holdout_peptides(long_df, holdout_frac=0.20, random_state=42):
     return train_df, test_df
 
 
-class Hybrid_PMF_dev:
+class Hybrid_PMF:
     """Hybrid Probabilistic Matrix Factorization model for MIC prediction."""
 
     def __init__(self, obs_df, pc_df, esm_df, tax_df, dim=10,

@@ -11,6 +11,7 @@ import pymc as pm
 import pytensor.tensor as pt
 import numpy as np
 import logging
+from pymc.sampling.jax import sample_numpyro_nuts
 
 
 logging.basicConfig(level=logging.INFO)
@@ -137,11 +138,11 @@ class Hybrid_PMF:
         for i in range(len(ranks) - 1):
             child = ranks[i]
             parent = ranks[i+1]
-            
+
             if child in tax_idx_df.columns and parent in tax_idx_df.columns:
                 # Drop duplicates and NaNs to ensure a clean 1-to-1 or Many-to-1 mapping
                 mapping = tax_idx_df[[child, parent]].dropna().drop_duplicates().astype(int)
-                
+
                 # Convert to dictionary: {child_idx: parent_idx}
                 dict_name = f"{child}_to_{parent}_idx"
                 hierarchies[dict_name] = mapping.set_index(child)[parent].to_dict()
@@ -222,7 +223,7 @@ class Hybrid_PMF:
                     # 3. Stitch them together using PyTensor
                     # This replaces the diagonal of the top KxK block of B_pc with strictly positive values.
                     B_pc = pt.set_subtensor(
-                        B_pc[np.arange(dim), np.arange(dim)], 
+                        B_pc[np.arange(dim), np.arange(dim)],
                         B_pc_anchors
                     )
 
@@ -256,25 +257,25 @@ class Hybrid_PMF:
                 if hierarchical:
                     V_genus = pm.Normal("V_genus", mu=0, sigma=1, dims=("genus", "latent_factor"))   # Make ZeroSumNormal?
                     if non_centered:
-                        V_species_raw = pm.Normal("V_species_raw", mu=0, 
+                        V_species_raw = pm.Normal("V_species_raw", mu=0,
                                             sigma=1, dims=("species", "latent_factor"))
-                        V_species = pm.Deterministic("V_species", V_genus[genus_idx_] + V_species_raw, 
+                        V_species = pm.Deterministic("V_species", V_genus[genus_idx_] + V_species_raw,
                                              dims=("species", "latent_factor"))
                     else:
-                        V_species = pm.Normal("V_species", mu=V_genus[genus_idx_], 
+                        V_species = pm.Normal("V_species", mu=V_genus[genus_idx_],
                                             sigma=1, dims=("species", "latent_factor"))
                     V_mu = V_species[spec_idx_]
                 else:
-                    V_mu = 0           
+                    V_mu = 0
 
                 #### hard coded sigma to avoid correlation with learned variance in U ####
                 if non_centered:
-                    V_strains_raw = pm.Normal("V_strains_raw", mu=0, 
+                    V_strains_raw = pm.Normal("V_strains_raw", mu=0,
                                         sigma=1, dims=("strain", "latent_factor"))
-                    V_strains = pm.Deterministic("V_strains", V_mu + V_strains_raw, 
+                    V_strains = pm.Deterministic("V_strains", V_mu + V_strains_raw,
                                          dims=("strain", "latent_factor"))
                 else:
-                    V_strains = pm.Normal("V_strains", mu=V_mu, 
+                    V_strains = pm.Normal("V_strains", mu=V_mu,
                                         sigma=1, dims=("strain", "latent_factor"))
 
             # --- INTERCEPTS ---
@@ -287,16 +288,16 @@ class Hybrid_PMF:
             if hierarchical:
                 beta_genus = pm.ZeroSumNormal("beta_genus", sigma=1, dims="genus")
                 if non_centered:
-                    beta_species_raw = pm.Normal("beta_species_raw", mu=0, 
+                    beta_species_raw = pm.Normal("beta_species_raw", mu=0,
                                      sigma=1, dims="species")
                     beta_species = pm.Deterministic("beta_species", beta_genus[genus_idx_] + beta_species_raw, dims="species")
                 else:
-                    beta_species = pm.Normal("beta_species", mu=beta_genus[genus_idx_], 
+                    beta_species = pm.Normal("beta_species", mu=beta_genus[genus_idx_],
                                               sigma=1, dims="species")
                 beta_mu = beta_species[spec_idx_]
             else:
-                beta_mu = 0            
-            
+                beta_mu = 0
+
             if non_centered:
                 # 1. Sample raw from a standard normal
                 beta_strain_raw = pm.Normal("beta_strain_raw", mu=0, sigma=1, dims="strain")
@@ -304,11 +305,11 @@ class Hybrid_PMF:
                 beta_strain = pm.Deterministic("beta_strain", beta_mu + beta_strain_raw * beta_strain_sigma, dims="strain")
             elif hierarchical:
                 beta_strain = pm.Normal("beta_strain", mu=beta_mu,
-                                        dims="strain", sigma=beta_strain_sigma)   
+                                        dims="strain", sigma=beta_strain_sigma)
             else:
                 beta_strain = pm.ZeroSumNormal("beta_strain",
                                         dims="strain", sigma=beta_strain_sigma)
-                
+
 
             # Peptide Intercept (Cold-start friendly mapping)
             w0_pc = pm.Normal("w0_pc", mu=0, sigma=1, dims="phys_chem")
@@ -456,20 +457,20 @@ class Hybrid_PMF:
         idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
 
         # Always plot the global mean
-        var_names = [] #["global_mu"]
+        var_names = []  # ["global_mu"]
         coords = {}
 
         if species_list is not None:
-            var_names.append("beta_species")
+            var_names.append("beta_strain")
             # Convert string names to the integer indices used in the model
-            coords["species"] = [self.strain_dict[s] for s in species_list]
+            coords["strain"] = [self.strain_dict[s] for s in species_list]
 
         if peptide_list is not None:
             var_names.append("alpha_peptide")
             coords["peptide"] = [self.peptide_dict[p] for p in peptide_list]
 
         var_names.append("sigma_obs")
-        var_names.append("beta_sigma_species")
+        var_names.append("beta_strain_sigma")
 
         # Plot using ArviZ
         az.plot_trace(idata, var_names=var_names, coords=coords, figsize=(12, 3 * len(var_names)), **kwargs)
@@ -543,4 +544,3 @@ class Hybrid_PMF:
         plt.axvline(0, color='red', linestyle='--', alpha=0.5)
 
         return axes
-    

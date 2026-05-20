@@ -92,7 +92,7 @@ import numpy as np
 import logging
 
 
-class Hybrid_PMF_dev:
+class Hybrid_PMF:
     """Hybrid Probabilistic Matrix Factorization model for MIC prediction."""
 
     def __init__(self, obs_df, pc_df, esm_df, tax_df, dim=10,

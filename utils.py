@@ -1,5 +1,7 @@
 import numpy as np
 import scipy.stats as stats
+import arviz as az
+import pymc as pm
 
 
 def compute_metrics(y_true, y_pred, label=""):
@@ -48,3 +50,21 @@ def split_holdout_peptides(long_df, holdout_frac=0.20, random_state=42):
     print(f"[peptide holdout]  train peptides={train_df['Peptide ID'].nunique()}"
           f"  test peptides={test_df['Peptide ID'].nunique()}  ({len(test_df)} obs)")
     return train_df, test_df
+
+
+def get_loo_comparisons(models, **kwargs):
+    loo_dict = {}
+
+    for name, model in models.items():
+        if 'log_likelihood' not in model.idata.keys() or len(model.idata.log_likelihood) == 0:
+            with model.model:
+                pm.compute_log_likelihood(model.idata)
+
+        loo = az.loo(model.idata, **kwargs)
+        loo_dict[name] = loo
+
+    df_comp_loo = az.compare({name: model.idata for name, model in models.items()})
+
+    az.plot_compare(df_comp_loo)
+
+    return loo_dict

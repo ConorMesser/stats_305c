@@ -19,78 +19,6 @@ SEED = 42
 
 rng = np.random.default_rng(SEED)
 
-def compute_metrics(y_true, y_pred, label=""):
-    mask = ~(np.isnan(y_true) | np.isnan(y_pred))
-    y_true, y_pred = y_true[mask], y_pred[mask]
-    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-    pearson_r,  pearson_p  = stats.pearsonr(y_true, y_pred)
-    spearman_r, spearman_p = stats.spearmanr(y_true, y_pred)
-    print(f"\n{'─'*48}")
-    if label:
-        print(f"  {label}")
-    print(f"  N        : {mask.sum()}")
-    print(f"  RMSE     : {rmse:.4f}")
-    print(f"  Pearson  : r={pearson_r:.4f}  p={pearson_p:.3g}")
-    print(f"  Spearman : r={spearman_r:.4f}  p={spearman_p:.3g}")
-    print(f"{'─'*48}\n")
-    return dict(n=int(mask.sum()), rmse=rmse,
-                pearson_r=pearson_r,  pearson_p=pearson_p,
-                spearman_r=spearman_r, spearman_p=spearman_p)
-
-# ─────────────────────────────────────────────────────────────
-# STRATEGY 1 — RANDOM MASK SPLIT
-# Hides individual observations regardless of peptide.
-# Tests interpolation: model has seen all peptides during training.
-# ─────────────────────────────────────────────────────────────
-
-def split_random_mask(long_df, holdout_frac=0.20, random_state=42):
-    rand_num_gen  = np.random.default_rng(random_state)
-    n        = len(long_df)
-    test_idx = rand_num_gen.choice(n, size=int(n * holdout_frac), replace=False)
-    mask     = np.zeros(n, dtype=bool)
-    mask[test_idx] = True
-
-    train_df = long_df[~mask].copy()
-    test_df  = long_df[ mask].copy()
-
-    print(f"[random mask]  train obs={len(train_df)}  test obs={len(test_df)}")
-    return train_df, test_df
-
-# ─────────────────────────────────────────────────────────────
-# STRATEGY 2 — HELD-OUT PEPTIDE SPLIT
-# Holds out entire peptides from training.
-# Tests generalization: model must predict from features alone.
-# ─────────────────────────────────────────────────────────────
-
-def split_holdout_peptides(long_df, holdout_frac=0.20, random_state=42):
-    #set holdouts
-    peptides  = long_df["Peptide ID"].unique()
-    rand_num_gen = np.random.default_rng(random_state)
-    n_holdout = max(1, int(len(peptides) * holdout_frac))
-    held_out  = set(rand_num_gen.choice(peptides, size=n_holdout, replace=False))
-
-    train_df = long_df[~long_df["Peptide ID"].isin(held_out)].copy()
-    test_df  = long_df[ long_df["Peptide ID"].isin(held_out)].copy()
-
-    print(f"[peptide holdout]  train peptides={train_df['Peptide ID'].nunique()}"
-          f"  test peptides={test_df['Peptide ID'].nunique()}  ({len(test_df)} obs)")
-    return train_df, test_df
-
-
-import pandas as pd
-import pathlib
-import matplotlib.pyplot as plt
-import os
-import arviz as az
-from sklearn.preprocessing import StandardScaler
-import pandas as pd
-import xarray as xr
-import scipy.stats as stats
-import pymc as pm
-import pytensor.tensor as pt
-import numpy as np
-import logging
-
 
 class Hybrid_PMF:
     """Hybrid Probabilistic Matrix Factorization model for MIC prediction."""
@@ -98,7 +26,8 @@ class Hybrid_PMF:
     def __init__(self, obs_df, pc_df, esm_df, tax_df, dim=10,
                  horseshoe=True, include_esm=True, non_centered=False,
                  linreg=False, hierarchical=False, anchor_pc=False,
-                 sigma_obs_sigma=3, b_pc_sigma=0.4, b_esm_sigma=0.05, beta_strains_sigma=3):
+                 sigma_obs_sigma=3, b_pc_sigma=0.4, b_esm_sigma=0.05, beta_strains_sigma=3,
+                 esm_active_num=15):
         """
         :param obs_df: DataFrame with ['Peptide ID', 'Target Species', 'mic']
                        (Uses LONG format)
@@ -250,19 +179,11 @@ class Hybrid_PMF:
                         # tau_esm = pm.HalfCauchy("tau_esm", beta=1)
                         # # Local shrinkage (One per ESM feature, applied across all K dims)
                         # lambda_esm = pm.HalfCauchy("lambda_esm", beta=1, dims="esm")
-                        # # Raw weights
-                        # B_esm_raw = pm.Normal("B_esm_raw", mu=0, sigma=1, dims=("esm", "latent_factor"))
-                        # # Decoupled matrix multiplication
-                        # B_esm = pm.Deterministic(
-                        #     "B_esm",
-                        #     B_esm_raw * (tau_esm * lambda_esm)[:, None],
-                        #     dims=("esm", "latent_factor")
-                        # )
+
                         # 1. Global Shrinkage (tau) - heavily squashed based on 1280 features
                         # Expecting only ~15 relevant features out of 1280
-                        p0 = 15
                         D = X_esm.shape[1]  # 1280
-                        tau_0 = p0 / (D - p0)
+                        tau_0 = esm_active_num / (D - esm_active_num)
                         tau_esm = pm.HalfNormal("tau_esm", sigma=tau_0)
 
                         # 2. Local Shrinkage (lambda) - Heavy tails to let signals escape

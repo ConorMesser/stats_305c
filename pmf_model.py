@@ -7,11 +7,15 @@ from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import xarray as xr
 import scipy.stats as stats
+from scipy.stats import norm
+from scipy.special import logsumexp
 import pymc as pm
 import pytensor.tensor as pt
 import numpy as np
 import logging
 from pymc.sampling.jax import sample_numpyro_nuts
+
+from utils import compute_metrics, split_random_mask, split_holdout_peptides
 
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +40,9 @@ class Hybrid_PMF:
         :param tax_df: pd.DataFrame with ['strain', 'species', 'genus',...]
         :param dim: Latent factors (K)
         """
+        # save parameters to keep track of model training
+        self.param_inputs
+
         self.name = "Hybrid_PMF"
         self.dim = dim
 
@@ -302,12 +309,13 @@ class Hybrid_PMF:
                 interaction = pt.zeros(pep_idx_.shape[0])
 
             # 3. Build the predicted mean
-            mu_obs = alpha_peptide[pep_idx_] + beta_strain[strain_idx_] + interaction  # + global_mu
+            mu_obs = pm.Deterministic("mu_obs", alpha_peptide[pep_idx_] + beta_strain[strain_idx_] + interaction,  # + global_mu,
+                                      dims="obs_id")
 
             # 4. Observation Noise
             sigma_obs = pm.HalfNormal("sigma_obs", sigma=sigma_obs_sigma)
 
-            # 5. Final Distribution (assuming output is not in log space yet)
+            # 5. Final Distribution
             pm.Normal("MIC_obs", mu=mu_obs, sigma=sigma_obs, observed=mic_, dims="obs_id")
 
         self.model = pmf
@@ -332,7 +340,7 @@ class Hybrid_PMF:
             self.idata_vi = pm.fit(**kwargs)
         return self.idata_vi
 
-    def predict_new_peptides(self, new_long_df, return_full_posterior=False):
+    def predict_new_peptides(self, new_long_df, return_full_posterior=False, var_names=None):
         # 1. Identify the unique peptides in this specific prediction batch
         predict_peps = new_long_df["Peptide ID"].unique()
 
@@ -375,9 +383,11 @@ class Hybrid_PMF:
             )
 
             idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
-            ppc = pm.sample_posterior_predictive(idata, extend_inferencedata=False)
+            ppc = pm.sample_posterior_predictive(idata, extend_inferencedata=False, var_names=var_names)
 
-        raw = ppc.posterior_predictive["MIC_obs"]
+        # if no var_names given, just return the final observations: MIC_obs
+        var_names = ["MIC_obs"] if var_names is None else var_names
+        raw = ppc.posterior_predictive[var_names]
         return raw if return_full_posterior else raw.mean(("chain", "draw")).values
 
     def evaluate(self, test_df, label=""):
@@ -385,6 +395,45 @@ class Hybrid_PMF:
         y_pred = self.predict_new_peptides(test_df)
         y_true = test_df["mic"].values
         return compute_metrics(y_true, y_pred, label=label)
+
+    def get_HDI_coverage(self, test_df, hdi_prob=0.95):
+        # 1. Get the FULL matrix of posterior predictions
+        # Shape will be (chains, draws, n_test_observations)
+        posterior_preds_xr = self.predict_new_peptides(test_df, return_full_posterior=True)
+
+        # 2. Calculate the HDI for every single test observation
+        # az.hdi returns an array of shape (n_test_observations, 2) containing [lower_bound, upper_bound]
+        hdi_bounds = az.hdi(posterior_preds_xr, hdi_prob=hdi_prob)["MIC_obs"].values
+
+        # 3. Check how many true values fall inside their respective HDIs
+        true_values = test_df["mic"].values
+        in_interval = (true_values >= hdi_bounds[:, 0]) & (true_values <= hdi_bounds[:, 1])
+
+        coverage_pct = in_interval.mean() * 100
+
+        return coverage_pct
+
+    def get_elpd_test(self, test_df, var_names=None):
+
+        y_true = test_df["mic"].values
+        posterior_preds_xr = self.predict_new_peptides(test_df, return_full_posterior=True,
+                                                  var_names=var_names)
+
+
+        mu_test_samples = posterior_preds_xr["mu_obs"].stack(sample=("chain", "draw")).values.T
+        sigma_samples = posterior_preds_xr["sigma_obs"].stack(sample=("chain", "draw")).values
+
+        # 2. Calculate log likelihood of the true test data for every posterior sample
+        # shape: (n_samples, n_test_obs)
+        log_lik_matrix = norm.logpdf(y_true, loc=mu_test_samples, scale=sigma_samples[:, None])
+
+        # 3. Average the probabilities (in log space) across all posterior samples for each test point
+        n_samples = log_lik_matrix.shape[0]
+        test_point_elpd = logsumexp(log_lik_matrix, axis=0) - np.log(n_samples)
+
+        # 4. Sum to get the total Test ELPD (Higher/less negative is better)
+        total_test_elpd = test_point_elpd.sum()
+        return total_test_elpd, test_point_elpd
 
     def _norms(self):
         """Return norms of latent variables at each step in the

@@ -30,8 +30,8 @@ class Hybrid_PMF:
     def __init__(self, obs_df, pc_df, esm_df, tax_df, dim=10,
                  horseshoe=True, include_esm=True, non_centered=False,
                  linreg=False, hierarchical=False, anchor_pc=False,
-                 sigma_obs_sigma=3, b_pc_sigma=0.4, b_esm_sigma=0.05, beta_strains_sigma=3,
-                 esm_active_num=15):
+                 sigma_obs_sigma=3, b_pc_sigma=0.4, esm_sigma=0.05, beta_strains_sigma=3,
+                 esm_active_num=15, slab_scale = 4.0):
         """
         :param obs_df: DataFrame with ['Peptide ID', 'Target Species', 'mic']
                        (Uses LONG format)
@@ -198,7 +198,6 @@ class Hybrid_PMF:
 
                         # 3. The Slab (c2) - This prevents the escaping signals from going to infinity
                         # Regularizes the tails so NUTS doesn't crash
-                        slab_scale = 2.0
                         c2 = pm.InverseGamma("c2", alpha=1.5, beta=1.5 * slab_scale ** 2)
 
                         # 4. Calculate the Regularized local shrinkage
@@ -214,7 +213,7 @@ class Hybrid_PMF:
                             dims=("esm", "latent_factor")
                         )
                     else:
-                        B_esm = pm.Normal("B_esm", mu=0, sigma=b_esm_sigma, dims=("esm", "latent_factor"))
+                        B_esm = pm.Normal("B_esm", mu=0, sigma=esm_sigma, dims=("esm", "latent_factor"))
 
                     # 3. Calculate Latent Peptides (U) via Matrix Dot Product
                     # U is shape (N_peptides, K)
@@ -289,7 +288,40 @@ class Hybrid_PMF:
             w0_pc = pm.Normal("w0_pc", mu=0, sigma=1, dims="phys_chem")
 
             if include_esm:
-                w0_esm = pm.Normal("w0_esm", mu=0, sigma=0.1, dims="esm")
+                if horseshoe:
+                    # # 2. ESM Features (COLUMN-WISE HORSESHOE PRIOR - Non-Centered)
+                    # # Global shrinkage
+                    # tau_esm = pm.HalfCauchy("tau_esm", beta=1)
+                    # # Local shrinkage (One per ESM feature, applied across all K dims)
+                    # lambda_esm = pm.HalfCauchy("lambda_esm", beta=1, dims="esm")
+
+                    # 1. Global Shrinkage (tau) - heavily squashed based on 1280 features
+                    # Expecting only ~15 relevant features out of 1280
+                    D = X_esm.shape[1]  # 1280
+                    tau_0 = esm_active_num / (D - esm_active_num)
+                    tau_esm_int = pm.HalfNormal("tau_esm_int", sigma=tau_0)
+
+                    # 2. Local Shrinkage (lambda) - Heavy tails to let signals escape
+                    lambda_esm_int = pm.HalfCauchy("lambda_esm_int", beta=1, dims="esm")
+
+                    # 3. The Slab (c2) - This prevents the escaping signals from going to infinity
+                    # Regularizes the tails so NUTS doesn't crash
+                    c2_int = pm.InverseGamma("c2_int", alpha=1.5, beta=1.5 * slab_scale ** 2)
+
+                    # 4. Calculate the Regularized local shrinkage
+                    lambda_tilde_int = pt.sqrt((c2_int * lambda_esm_int ** 2) / (c2_int + tau_esm_int ** 2 * lambda_esm_int ** 2))
+
+                    # 5. Non-centered raw weights
+                    w0_esm_raw = pm.Normal("w0_esm_raw", mu=0, sigma=1, dims="esm")
+
+                    # 6. Final Weights
+                    w0_esm = pm.Deterministic(
+                        "w0_esm",
+                        w0_esm_raw * (tau_esm_int * lambda_tilde_int)[:, None],
+                        dims="esm"
+                    )
+                else:
+                    w0_esm = pm.Normal("B_esm", mu=0, sigma=esm_sigma, dims="esm")
                 alpha_peptide = pm.Deterministic("alpha_peptide", pt.dot(X_pc, w0_pc) + pt.dot(X_esm, w0_esm),
                                                  dims="peptide")
             else:

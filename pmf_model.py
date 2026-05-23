@@ -325,7 +325,7 @@ class Hybrid_PMF:
                     # 6. Final Weights
                     w0_esm = pm.Deterministic(
                         "w0_esm",
-                        w0_esm_raw * (tau_esm_int * lambda_tilde_int)[:, None],
+                        w0_esm_raw * (tau_esm_int * lambda_tilde_int),
                         dims="esm"
                     )
                 else:

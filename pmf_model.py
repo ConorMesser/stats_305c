@@ -31,9 +31,9 @@ class Hybrid_PMF:
     """Hybrid Probabilistic Matrix Factorization model for MIC prediction."""
 
     def __init__(self, obs_df, pc_df, esm_df, tax_df, dim=10,
-                 horseshoe=True, include_esm=True, non_centered=False,
+                 horseshoe_u=False, horseshoe_intercept=True, include_esm=True, non_centered=False,
                  linreg=False, hierarchical=False, anchor_pc=False,
-                 sigma_obs_sigma=3, b_pc_sigma=0.4, esm_sigma=0.05, beta_strains_sigma=3,
+                 sigma_obs_sigma=3, pc_sigma=0.4, esm_sigma=0.05, beta_sigma=3,
                  esm_active_num=15, slab_scale = 4.0):
         """
         :param obs_df: DataFrame with ['Peptide ID', 'Target Species', 'mic']
@@ -45,10 +45,10 @@ class Hybrid_PMF:
         """
         # save parameters to keep track of model training
         self.param_inputs = dict(dim=dim,
-                 horseshoe=horseshoe, include_esm=include_esm, non_centered=non_centered,
-                 linreg=linreg, hierarchical=hierarchical, anchor_pc=anchor_pc,
-                 sigma_obs_sigma=sigma_obs_sigma, b_pc_sigma=b_pc_sigma, esm_sigma=esm_sigma, beta_strains_sigma=beta_strains_sigma,
-                 esm_active_num=esm_active_num, slab_scale = slab_scale,
+                                 horseshoe_u=horseshoe_u, horseshoe_intercept=horseshoe_intercept, include_esm=include_esm, non_centered=non_centered,
+                                 linreg=linreg, hierarchical=hierarchical, anchor_pc=anchor_pc,
+                                 sigma_obs_sigma=sigma_obs_sigma, pc_sigma=pc_sigma, esm_sigma=esm_sigma, beta_sigma=beta_sigma,
+                                 esm_active_num=esm_active_num, slab_scale = slab_scale,
                                  obs_df_shape=obs_df.shape, pc_df_shape=pc_df.shape, esm_df_shape=esm_df.shape)
 
         self.name = "Hybrid_PMF"
@@ -175,11 +175,11 @@ class Hybrid_PMF:
                 # --- HYBRID PEPTIDE MAPPING (u_i) ---
                 # 1. Physical Features (Standard Weakly Informative Prior)
                 # 1. Sample the unconstrained bulk of the weights
-                B_pc = pm.Normal("B_pc", mu=0, sigma=b_pc_sigma, dims=("phys_chem", "latent_factor"))
+                B_pc = pm.Normal("B_pc", mu=0, sigma=pc_sigma, dims=("phys_chem", "latent_factor"))
 
                 if anchor_pc and dim <= 12:
                     # 2. Sample K positive anchors
-                    B_pc_anchors = pm.HalfNormal("B_pc_anchors", sigma=b_pc_sigma, shape=dim)
+                    B_pc_anchors = pm.HalfNormal("B_pc_anchors", sigma=pc_sigma, shape=dim)
 
                     # 3. Stitch them together using PyTensor
                     # This replaces the diagonal of the top KxK block of B_pc with strictly positive values.
@@ -189,7 +189,7 @@ class Hybrid_PMF:
                     )
 
                 if include_esm:
-                    if horseshoe:
+                    if horseshoe_u:
                         # # 2. ESM Features (COLUMN-WISE HORSESHOE PRIOR - Non-Centered)
                         # # Global shrinkage
                         # tau_esm = pm.HalfCauchy("tau_esm", beta=1)
@@ -232,19 +232,23 @@ class Hybrid_PMF:
                     U = pm.Deterministic("U", pt.dot(X_pc, B_pc), dims=("peptide", "latent_factor"))
 
                 # --- TAXONOMIC HIERARCHY (v_j) ---
-                # sigma_species = pm.HalfNormal("sigma_species",
-                #                               sigma=1) #, dims=("latent_factor")) # shape D or 1?
+                v_strains_sigma = pm.HalfNormal("v_strains_sigma",
+                                                sigma=beta_sigma) #, dims=("latent_factor")) # shape D or 1?
                 if hierarchical:
-                    V_genus = pm.Normal("V_genus", mu=0, sigma=1,
+                    v_genus_sigma = pm.HalfNormal("v_genus_sigma",
+                                                    sigma=beta_sigma)
+                    v_species_sigma = pm.HalfNormal("v_species_sigma",
+                                                    sigma=beta_sigma)
+                    V_genus = pm.Normal("V_genus", mu=0, sigma=v_genus_sigma,
                                         dims=("genus", "latent_factor"))  # Make ZeroSumNormal?
                     if non_centered:
                         V_species_raw = pm.Normal("V_species_raw", mu=0,
                                                   sigma=1, dims=("species", "latent_factor"))
-                        V_species = pm.Deterministic("V_species", V_genus[genus_idx_] + V_species_raw,
+                        V_species = pm.Deterministic("V_species", V_genus[genus_idx_] + (V_species_raw * v_species_sigma),
                                                      dims=("species", "latent_factor"))
                     else:
                         V_species = pm.Normal("V_species", mu=V_genus[genus_idx_],
-                                              sigma=1, dims=("species", "latent_factor"))
+                                              sigma=v_species_sigma, dims=("species", "latent_factor"))
                     V_mu = V_species[spec_idx_]
                 else:
                     V_mu = 0
@@ -253,25 +257,28 @@ class Hybrid_PMF:
                 if non_centered:
                     V_strains_raw = pm.Normal("V_strains_raw", mu=0,
                                               sigma=1, dims=("strain", "latent_factor"))
-                    V_strains = pm.Deterministic("V_strains", V_mu + V_strains_raw,
+                    V_strains = pm.Deterministic("V_strains", V_mu + V_strains_raw * v_strains_sigma,
                                                  dims=("strain", "latent_factor"))
                 else:
                     V_strains = pm.Normal("V_strains", mu=V_mu,
-                                          sigma=1, dims=("strain", "latent_factor"))
+                                          sigma=v_strains_sigma, dims=("strain", "latent_factor"))
 
             # --- INTERCEPTS ---
             ## global_mu removed to avoid centering issue (where sampler can add to mu and subtract elsewhere)
             ## required that I subtract the mean from the dataset before inputting
 
             # Strain Intercept (Hierarchical Intrinsic Resistance)
-            beta_strain_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_strains_sigma)
+            beta_strain_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_sigma)
 
             if hierarchical:
-                beta_genus = pm.ZeroSumNormal("beta_genus", sigma=1, dims="genus")
+                beta_genus_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_sigma)
+                beta_species_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_sigma)
+
+                beta_genus = pm.ZeroSumNormal("beta_genus", sigma=beta_genus_sigma, dims="genus")
                 if non_centered:
                     beta_species_raw = pm.Normal("beta_species_raw", mu=0,
                                                  sigma=1, dims="species")
-                    beta_species = pm.Deterministic("beta_species", beta_genus[genus_idx_] + beta_species_raw,
+                    beta_species = pm.Deterministic("beta_species", beta_genus[genus_idx_] + (beta_species_raw * beta_species_sigma),
                                                     dims="species")
                 else:
                     beta_species = pm.Normal("beta_species", mu=beta_genus[genus_idx_],
@@ -294,10 +301,10 @@ class Hybrid_PMF:
                                                dims="strain", sigma=beta_strain_sigma)
 
             # Peptide Intercept (Cold-start friendly mapping)
-            w0_pc = pm.Normal("w0_pc", mu=0, sigma=1, dims="phys_chem")
+            w0_pc = pm.Normal("w0_pc", mu=0, sigma=pc_sigma, dims="phys_chem")
 
             if include_esm:
-                if horseshoe:
+                if horseshoe_intercept:
                     # # 2. ESM Features (COLUMN-WISE HORSESHOE PRIOR - Non-Centered)
                     # # Global shrinkage
                     # tau_esm = pm.HalfCauchy("tau_esm", beta=1)

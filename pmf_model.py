@@ -1,3 +1,5 @@
+import pickle
+
 import pandas as pd
 import pathlib
 import matplotlib.pyplot as plt
@@ -5,6 +7,7 @@ import os
 import arviz as az
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
+import json
 import xarray as xr
 import scipy.stats as stats
 from scipy.stats import norm
@@ -599,3 +602,8 @@ class Hybrid_PMF:
         plt.axvline(0, color='red', linestyle='--', alpha=0.5)
 
         return axes
+
+    def save(self, path):
+        self.idata.to_netcdf(path + 'nc')
+        with open(path + 'txt', 'w') as f:
+            json.dump(self.param_inputs, f, indent=4)

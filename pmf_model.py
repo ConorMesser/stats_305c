@@ -326,7 +326,7 @@ class Hybrid_PMF:
                         dims="esm"
                     )
                 else:
-                    w0_esm = pm.Normal("B_esm", mu=0, sigma=esm_sigma, dims="esm")
+                    w0_esm = pm.Normal("w0_esm", mu=0, sigma=esm_sigma, dims="esm")
                 alpha_peptide = pm.Deterministic("alpha_peptide", pt.dot(X_pc, w0_pc) + pt.dot(X_esm, w0_esm),
                                                  dims="peptide")
             else:

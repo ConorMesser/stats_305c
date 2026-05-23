@@ -53,6 +53,7 @@ class Hybrid_PMF:
 
         self.name = "Hybrid_PMF"
         self.dim = dim
+        self.obs_df = obs_df
 
         # Clean Data
         strain_dict = {strain: idx for idx, strain in enumerate(obs_df['Target Species'].unique())}
@@ -436,7 +437,7 @@ class Hybrid_PMF:
         y_true = test_df["mic"].values
         return compute_metrics(y_true, y_pred, label=label)
 
-    def get_HDI_coverage(self, test_df, hdi_prob=0.95):
+    def get_HDI_coverage(self, test_df, hdi_prob=0.94):
         # 1. Get the FULL matrix of posterior predictions
         # Shape will be (chains, draws, n_test_observations)
         posterior_preds_xr = self.predict_new_peptides(test_df, return_full_posterior=True)
@@ -474,6 +475,52 @@ class Hybrid_PMF:
         # 4. Sum to get the total Test ELPD (Higher/less negative is better)
         total_test_elpd = test_point_elpd.sum()
         return total_test_elpd, test_point_elpd
+
+    def full_evaluation(self, test_df):
+        """
+        on the training data (save for each value)
+        -run LOO-CV
+        -run RMSE
+
+        on test data (save for each)
+        -calculate ELPD
+        -RMSE
+
+        Calculate HDI - 94%
+        """
+        # training data
+        if 'log_likelihood' not in self.idata.keys() or len(self.idata.log_likelihood) == 0:
+            with self.model:
+                pm.compute_log_likelihood(self.idata)
+
+        train_loo_cv_vals = az.loo(self.idata)
+
+        y_pred_train = self.predict_new_peptides(self.obs_df)
+        y_true_train = test_df["mic"].values
+        error_train = y_true_train - y_pred_train
+        rmse_train = np.sqrt(np.mean(error_train ** 2))
+
+        train_data = self.obs_df.copy()
+        train_data['elpd'] = train_loo_cv_vals
+        train_data['error'] = error_train
+
+        # test data
+        y_pred = self.predict_new_peptides(test_df)
+        y_true = test_df["mic"].values
+        error = y_true - y_pred
+        rmse = np.sqrt(np.mean(error ** 2))
+
+        total_test_elpd, test_point_elpd = self.get_elpd_test(test_df)
+
+        test_df['elpd'] = test_point_elpd
+        test_df['error'] = error
+
+        return train_data, test_df, dict(rmse_train=rmse_train, rmse_test=rmse,
+                                         elpd_train=train_loo_cv_vals.sum(), elpd_test=total_test_elpd)
+
+
+
+
 
     def _norms(self):
         """Return norms of latent variables at each step in the
@@ -604,6 +651,6 @@ class Hybrid_PMF:
         return axes
 
     def save(self, path):
-        self.idata.to_netcdf(path + 'nc')
-        with open(path + 'txt', 'w') as f:
+        self.idata.to_netcdf(path + '.nc')
+        with open(path + '.txt', 'w') as f:
             json.dump(self.param_inputs, f, indent=4)

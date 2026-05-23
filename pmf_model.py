@@ -15,7 +15,7 @@ import numpy as np
 import logging
 from pymc.sampling.jax import sample_numpyro_nuts
 
-from utils import compute_metrics, split_random_mask, split_holdout_peptides
+from .utils import compute_metrics, split_random_mask, split_holdout_peptides
 
 
 logging.basicConfig(level=logging.INFO)

@@ -41,7 +41,12 @@ class Hybrid_PMF:
         :param dim: Latent factors (K)
         """
         # save parameters to keep track of model training
-        self.param_inputs
+        self.param_inputs = dict(dim=dim,
+                 horseshoe=horseshoe, include_esm=include_esm, non_centered=non_centered,
+                 linreg=linreg, hierarchical=hierarchical, anchor_pc=anchor_pc,
+                 sigma_obs_sigma=sigma_obs_sigma, b_pc_sigma=b_pc_sigma, esm_sigma=esm_sigma, beta_strains_sigma=beta_strains_sigma,
+                 esm_active_num=esm_active_num, slab_scale = slab_scale,
+                                 obs_df_shape=obs_df.shape, pc_df_shape=pc_df.shape, esm_df_shape=esm_df.shape)
 
         self.name = "Hybrid_PMF"
         self.dim = dim

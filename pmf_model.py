@@ -183,9 +183,9 @@ class Hybrid_PMF:
             mic_ = pm.Data("mic", obs_mic, dims="obs_id").astype(np.float32)
 
             X_pc = pm.Data("X_pc", pc_input, dims=("peptide", "phys_chem")).astype(np.float32)
-            if esm_intercept:
+            if use_esm_intercept:
                 X_esm_intercept = pm.Data("X_esm_intercept", esm_intercept_input, dims=("peptide", "esm_intercept")).astype(np.float32)
-            if esm_interaction:
+            if use_esm_interaction:
                 X_esm_interaction = pm.Data("X_esm_interaction", esm_interaction_input, dims=("peptide", "esm_interaction")).astype(np.float32)
 
             if not linreg:

@@ -271,8 +271,8 @@ class Hybrid_PMF:
             beta_strain_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_sigma)
 
             if hierarchical:
-                beta_genus_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_sigma)
-                beta_species_sigma = pm.HalfNormal("beta_strain_sigma", sigma=beta_sigma)
+                beta_genus_sigma = pm.HalfNormal("beta_genus_sigma", sigma=beta_sigma)
+                beta_species_sigma = pm.HalfNormal("beta_species_sigma", sigma=beta_sigma)
 
                 beta_genus = pm.ZeroSumNormal("beta_genus", sigma=beta_genus_sigma, dims="genus")
                 if non_centered:

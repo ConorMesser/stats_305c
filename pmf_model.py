@@ -500,7 +500,7 @@ class Hybrid_PMF:
             with self.model:
                 pm.compute_log_likelihood(self.idata)
 
-        train_loo_cv_vals = az.loo(self.idata)
+        train_loo_cv_vals = az.loo(self.idata).loo_i.values
 
         y_pred_train = self.predict_new_peptides(self.obs_df, return_full_posterior=True).mean(("chain", "draw")).MIC_obs.values
         y_true_train = self.obs_df["mic"].values
@@ -518,7 +518,7 @@ class Hybrid_PMF:
         error = y_true - y_pred
         rmse = np.sqrt(np.mean(error ** 2))
 
-        total_test_elpd, test_point_elpd = self.get_elpd_test(test_df)
+        total_test_elpd, test_point_elpd = self.get_elpd_test(test_df, var_names=["mu_obs", "sigma_obs"])
 
         test_df['elpd'] = test_point_elpd
         test_df['error'] = error

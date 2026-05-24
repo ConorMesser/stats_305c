@@ -503,7 +503,7 @@ class Hybrid_PMF:
         train_loo_cv_vals = az.loo(self.idata)
 
         y_pred_train = self.predict_new_peptides(self.obs_df, return_full_posterior=True).mean(("chain", "draw")).MIC_obs.values
-        y_true_train = test_df["mic"].values
+        y_true_train = self.obs_df["mic"].values
         error_train = y_true_train - y_pred_train
         rmse_train = np.sqrt(np.mean(error_train ** 2))
 

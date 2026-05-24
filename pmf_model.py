@@ -195,24 +195,18 @@ class Hybrid_PMF:
                 sigma_b_pc = pm.HalfNormal("sigma_b_pc", sigma=1.0)
 
                 if anchor_pc and dim <= pc_input.shape[1]:
-                    # 1. Strictly positive diagonal (breaks reflection invariance)
-                    B_pc_diag = pm.HalfNormal("B_pc_diag", sigma=sigma_b_pc, shape=dim)
+                    # 1. Sample the unconstrained bulk of the weights
+                    B_pc_raw = pm.Normal("B_pc_raw", mu=0, sigma=sigma_b_pc, dims=("phys_chem", "latent_factor"))
 
-                    # 2. Free parameters for the lower triangle (below the diagonal)
-                    # For K=6, this is (6 * 5) / 2 = 15 parameters
-                    n_lower = (dim * (dim - 1)) // 2
-                    B_pc_lower = pm.Normal("B_pc_lower", mu=0, sigma=sigma_b_pc, shape=n_lower)
+                    # 2. Sample K positive anchors
+                    B_pc_anchors = pm.HalfNormal("B_pc_anchors", sigma=sigma_b_pc, shape=dim)
 
-                    # 3. Build the top KxK lower-triangular block using PyTensor
-                    B_pc_top = pt.zeros((dim, dim))
-                    B_pc_top = pt.set_subtensor(B_pc_top[np.diag_indices(dim)], B_pc_diag)
-                    B_pc_top = pt.set_subtensor(B_pc_top[np.tril_indices(dim, -1)], B_pc_lower)
-
-                    # 4. Free parameters for the remaining rows (the bottom 6x6 block)
-                    # These represent the remaining physical-chemical features mapped to the latent space
-                    B_pc_bottom = pm.Normal("B_pc_bottom", mu=0, sigma=sigma_b_pc, shape=(pc_input.shape[1] - dim, dim))
-
-                    B_pc = pt.concatenate([B_pc_top, B_pc_bottom], axis=0)
+                    # 3. Stitch them together using PyTensor
+                    # This replaces the diagonal of the top KxK block of B_pc with strictly positive values.
+                    B_pc = pt.set_subtensor(
+                        B_pc_raw[np.arange(dim), np.arange(dim)],
+                        B_pc_anchors
+                    )
                 else:
                     B_pc = pm.Normal("B_pc", mu=0, sigma=sigma_b_pc, dims=("phys_chem", "latent_factor"))
 

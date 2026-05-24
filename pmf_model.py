@@ -436,11 +436,11 @@ class Hybrid_PMF:
         # if no var_names given, just return the final observations: MIC_obs
         var_names = ["MIC_obs"] if var_names is None else var_names
         raw = ppc.posterior_predictive[var_names]
-        return raw if return_full_posterior else raw.mean(("chain", "draw")).values
+        return raw if return_full_posterior else raw.mean(("chain", "draw"))
 
     def evaluate(self, test_df, label=""):
         # check for MCMC first
-        y_pred = self.predict_new_peptides(test_df)
+        y_pred = self.predict_new_peptides(test_df, return_full_posterior=True).mean(("chain", "draw")).MIC_obs.values
         y_true = test_df["mic"].values
         return compute_metrics(y_true, y_pred, label=label)
 
@@ -502,7 +502,7 @@ class Hybrid_PMF:
 
         train_loo_cv_vals = az.loo(self.idata)
 
-        y_pred_train = self.predict_new_peptides(self.obs_df)
+        y_pred_train = self.predict_new_peptides(self.obs_df, return_full_posterior=True).mean(("chain", "draw")).MIC_obs.values
         y_true_train = test_df["mic"].values
         error_train = y_true_train - y_pred_train
         rmse_train = np.sqrt(np.mean(error_train ** 2))
@@ -512,7 +512,8 @@ class Hybrid_PMF:
         train_data['error'] = error_train
 
         # test data
-        y_pred = self.predict_new_peptides(test_df)
+        y_pred = self.predict_new_peptides(test_df, return_full_posterior=True).mean(
+            ("chain", "draw")).MIC_obs.values
         y_true = test_df["mic"].values
         error = y_true - y_pred
         rmse = np.sqrt(np.mean(error ** 2))
@@ -524,9 +525,6 @@ class Hybrid_PMF:
 
         return train_data, test_df, dict(rmse_train=rmse_train, rmse_test=rmse,
                                          elpd_train=train_loo_cv_vals.sum(), elpd_test=total_test_elpd)
-
-
-
 
 
     def _norms(self):

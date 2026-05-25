@@ -436,18 +436,16 @@ class Hybrid_PMF:
         # Extract their features from master dataframes and set to order of the local dictionary
         # Assumes original_idx is a column containing the Peptide IDs
         pc_df_predict = self.pc_df[self.pc_df['original_idx'].isin(predict_peps)]
-        pc_input = pc_df_predict.set_index('original_idx').loc[predict_peps]
+        pc_input = pc_df_predict.set_index('original_idx').loc[predict_peps].values
+
+        esm_data_dict = {}
         if self.esm_intercept_df is not None:
             esm_intercept_predict = self.esm_intercept_df[self.esm_intercept_df['original_idx'].isin(predict_peps)]
-            esm_intercept_input = esm_intercept_predict.set_index('original_idx').loc[predict_peps]
-        else:
-            esm_intercept_input = None
+            esm_data_dict["X_esm_intercept"] = esm_intercept_predict.set_index('original_idx').loc[predict_peps].values
 
         if self.esm_interaction_df is not None:
             esm_interaction_predict = self.esm_interaction_df[self.esm_interaction_df['original_idx'].isin(predict_peps)]
-            esm_interaction_input = esm_interaction_predict.set_index('original_idx').loc[predict_peps]
-        else:
-            esm_interaction_input = None
+            esm_data_dict["X_esm_interaction"] = esm_interaction_predict.set_index('original_idx').loc[predict_peps].values
 
         # Ensure all target species exist in the training dictionary
         assert len(set(new_long_df["Target Species"]) - set(self.strain_dict.keys())) == 0, \
@@ -461,9 +459,8 @@ class Hybrid_PMF:
                     "pep_idx": obs_peptide_idx,
                     "strain_idx": obs_strain_idx,
                     "mic": np.ones(len(new_long_df)),  # Dummy values for shape
-                    "X_pc": pc_input.values,
-                    "X_esm_intercept": esm_intercept_input.values,
-                    "X_esm_interaction": esm_interaction_input.values,
+                    "X_pc": pc_input,
+                    **esm_data_dict
                 },
                 coords={
                     "obs_id": range(len(new_long_df)),

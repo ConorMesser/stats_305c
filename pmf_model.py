@@ -33,7 +33,7 @@ class Hybrid_PMF:
     def __init__(self, obs_df, pc_df, tax_df, dim=10,
                  horseshoe_u=False, horseshoe_intercept=True, non_centered=False,
                  esm_intercept=None, esm_interaction=None,
-                 linreg=False, hierarchical=False, anchor_pc=False,
+                 linreg=False, hierarchical=False, anchor_pc=False, random_effects=False,
                  sigma_obs_sigma=3, beta_sigma=2,
                  esm_active_num=15, slab_scale = 4.0):
         """
@@ -50,13 +50,18 @@ class Hybrid_PMF:
         esm_interaction_shape = (0,0) if not use_esm_interaction else esm_interaction.shape
 
         self.param_inputs = dict(dim=dim,
-                                 horseshoe_u=horseshoe_u, horseshoe_intercept=horseshoe_intercept, non_centered=non_centered,
-                                 linreg=linreg, hierarchical=hierarchical, anchor_pc=anchor_pc,
+                                 horseshoe_u=horseshoe_u, horseshoe_intercept=horseshoe_intercept,
+                                 non_centered=non_centered, linreg=linreg, hierarchical=hierarchical,
+                                 anchor_pc=anchor_pc, random_effects=random_effects,
                                  sigma_obs_sigma=sigma_obs_sigma, beta_sigma=beta_sigma,
                                  esm_active_num=esm_active_num, slab_scale = slab_scale,
                                  obs_df_shape=obs_df.shape, pc_df_shape=pc_df.shape,
                                  esm_intercept_shape=esm_intercept_shape, esm_interaction_shape=esm_interaction_shape)
 
+        assert not (random_effects and linreg), ('Random_effects and linreg cannot both be set to true, '
+                                                 'as linear regression means no interaction.')
+        assert not (use_esm_interaction and linreg), ('esm_interaction cannot be provided with linreg, '
+                                                      'as linear regression means no interaction.')
         self.name = "Hybrid_PMF"
         self.dim = dim
         self.obs_df = obs_df
@@ -134,12 +139,16 @@ class Hybrid_PMF:
             esm_intercept.index = esm_intercept.index.map(peptide_dict)
             self.esm_intercept_df = esm_intercept
             esm_intercept_input = esm_intercept.loc[unique_pep_idx].iloc[:, :-1].values
+        else:
+            esm_intercept_input = None
 
         if use_esm_interaction:
             esm_interaction['original_idx'] = esm_interaction.index
             esm_interaction.index = esm_interaction.index.map(peptide_dict)
             self.esm_interaction_df = esm_interaction
             esm_interaction_input = esm_interaction.loc[unique_pep_idx].iloc[:, :-1].values
+        else:
+            esm_interaction_input = None
 
         n_peptides = len(np.unique(obs_peptide_idx))
         n_strains = len(np.unique(obs_strain_idx))
@@ -189,82 +198,64 @@ class Hybrid_PMF:
                 X_esm_interaction = pm.Data("X_esm_interaction", esm_interaction_input, dims=("peptide", "esm_interaction")).astype(np.float32)
 
             if not linreg:
-                # --- HYBRID PEPTIDE MAPPING (u_i) ---
-                # 1. Physical Features (Standard Weakly Informative Prior)
-                # 1. Sample the unconstrained bulk of the weights
-                sigma_b_pc = pm.HalfNormal("sigma_b_pc", sigma=1.0)
+                if random_effects:
+                    # Sample a separate U for each peptide with no learning from phys_chem features or ESM
+                    sigma_u = pm.HalfNormal("sigma_u", 1.0)
 
-                if anchor_pc and dim <= pc_input.shape[1]:
-                    # 1. Sample the unconstrained bulk of the weights
-                    B_pc_raw = pm.Normal("B_pc_raw", mu=0, sigma=sigma_b_pc, dims=("phys_chem", "latent_factor"))
-
-                    # 2. Sample K positive anchors
-                    B_pc_anchors = pm.HalfNormal("B_pc_anchors", sigma=sigma_b_pc, shape=dim)
-
-                    # 3. Stitch them together using PyTensor
-                    # This replaces the diagonal of the top KxK block of B_pc with strictly positive values.
-                    B_pc = pt.set_subtensor(
-                        B_pc_raw[np.arange(dim), np.arange(dim)],
-                        B_pc_anchors
-                    )
+                    if non_centered:
+                        U_raw = pm.Normal("U_raw", mu=0,
+                                                  sigma=1, dims=("peptide", "latent_factor"))
+                        U = pm.Deterministic("V_strains", U_raw * sigma_u,
+                                                     dims=("peptide", "latent_factor"))
+                    else:
+                        U = pm.Normal("U", mu=0, sigma=sigma_u, dims=("peptide", "latent_factor"))
                 else:
-                    B_pc = pm.Normal("B_pc", mu=0, sigma=sigma_b_pc, dims=("phys_chem", "latent_factor"))
 
-                if use_esm_interaction:
-                    if horseshoe_u:
-                        # # 2. ESM Features (COLUMN-WISE HORSESHOE PRIOR - Non-Centered)
-                        # # Global shrinkage
-                        # tau_esm = pm.HalfCauchy("tau_esm", beta=1)
-                        # # Local shrinkage (One per ESM feature, applied across all K dims)
-                        # lambda_esm = pm.HalfCauchy("lambda_esm", beta=1, dims="esm")
+                    # --- HYBRID PEPTIDE MAPPING (u_i) ---
+                    # Learn variance of Physical Features (Standard Weakly Informative Prior)
+                    sigma_b_pc = pm.HalfNormal("sigma_b_pc", sigma=1.0)
 
-                        # 1. Global Shrinkage (tau) - heavily squashed based on 1280 features
-                        # Expecting only ~15 relevant features out of 1280
-                        D = X_esm_interaction.shape[1]  # 1280
-                        tau_0 = esm_active_num / (D - esm_active_num)
-                        tau_esm = pm.HalfNormal("tau_esm", sigma=tau_0)
+                    # Anchor the physical_chemical features to prevent sign flipping instability
+                    if anchor_pc and dim <= pc_input.shape[1]:
+                        B_pc_raw = pm.Normal("B_pc_raw", mu=0, sigma=sigma_b_pc, dims=("phys_chem", "latent_factor"))
 
-                        # 2. Local Shrinkage (lambda) - Heavy tails to let signals escape
-                        lambda_esm = pm.HalfCauchy("lambda_esm", beta=1, dims="esm_interaction")
+                        # Sample K positive anchors
+                        B_pc_anchors = pm.HalfNormal("B_pc_anchors", sigma=sigma_b_pc, shape=dim)
 
-                        # 3. The Slab (c2) - This prevents the escaping signals from going to infinity
-                        # Regularizes the tails so NUTS doesn't crash
-                        c2 = pm.InverseGamma("c2", alpha=1.5, beta=1.5 * slab_scale ** 2)
-
-                        # 4. Calculate the Regularized local shrinkage
-                        lambda_tilde = pt.sqrt((c2 * lambda_esm ** 2) / (c2 + tau_esm ** 2 * lambda_esm ** 2))
-
-                        # 5. Non-centered raw weights
-                        B_esm_raw = pm.Normal("B_esm_raw", mu=0, sigma=1, dims=("esm_interaction", "latent_factor"))
-
-                        # 6. Final Weights
-                        B_esm = pm.Deterministic(
-                            "B_esm",
-                            B_esm_raw * (tau_esm * lambda_tilde)[:, None],
-                            dims=("esm_interaction", "latent_factor")
+                        # Stitch them together using PyTensor
+                        # This replaces the diagonal of the top KxK block of B_pc with strictly positive values.
+                        B_pc = pt.set_subtensor(
+                            B_pc_raw[np.arange(dim), np.arange(dim)],
+                            B_pc_anchors
                         )
                     else:
-                        sigma_b_esm = pm.HalfNormal("sigma_b_esm", sigma=1.0)
-                        B_esm = pm.Normal("B_esm", mu=0, sigma=sigma_b_esm, dims=("esm_interaction", "latent_factor"))
+                        B_pc = pm.Normal("B_pc", mu=0, sigma=sigma_b_pc, dims=("phys_chem", "latent_factor"))
 
-                    # 3. Calculate Latent Peptides (U) via Matrix Dot Product
-                    # U is shape (N_peptides, K)
-                    U = pm.Deterministic("U", pt.dot(X_pc, B_pc) + pt.dot(X_esm_interaction, B_esm),
-                                         dims=("peptide", "latent_factor"))
-                else:
-                    U = pm.Deterministic("U", pt.dot(X_pc, B_pc), dims=("peptide", "latent_factor"))
+                    if use_esm_interaction:
+                        if horseshoe_u:
+                            B_esm = self._horseshoe(X_esm_interaction, esm_active_num, slab_scale, intercept=False)
+                        else:
+                            sigma_b_esm = pm.HalfNormal("sigma_b_esm", sigma=1.0)
+                            B_esm = pm.Normal("B_esm", mu=0, sigma=sigma_b_esm, dims=("esm_interaction", "latent_factor"))
+
+                        # 3. Calculate Latent Peptides (U) via Matrix Dot Product
+                        # U is shape (N_peptides, K)
+                        U = pm.Deterministic("U", pt.dot(X_pc, B_pc) + pt.dot(X_esm_interaction, B_esm),
+                                             dims=("peptide", "latent_factor"))
+                    else:
+                        U = pm.Deterministic("U", pt.dot(X_pc, B_pc), dims=("peptide", "latent_factor"))
 
                 # --- TAXONOMIC HIERARCHY (v_j) ---
+                # V_strains is sampled the sample regardless of if random_effects model or not,
+                # as we don't have strain features to utilize as a hybrid model
                 if hierarchical:
-                    # Direichlet ensures variance is identifiable between U and V
+                    # Dirichlet ensures variance is identifiable between U and V - constrains the total V variance
                     var_fracs = pm.Dirichlet("var_fracs", a=np.ones(3))
 
                     # 2. Convert the variance fractions to standard deviations
                     v_genus_sigma = pm.Deterministic("sig_genus", pt.sqrt(var_fracs[0]))
                     v_species_sigma = pm.Deterministic("sig_species", pt.sqrt(var_fracs[1]))
                     v_strains_sigma = pm.Deterministic("sig_strain", pt.sqrt(var_fracs[2]))
-                    # v_genus_sigma = pm.HalfNormal("v_genus_sigma", sigma=beta_sigma)  # changed to Dirichlet
-                    # v_species_sigma = pm.HalfNormal("v_species_sigma", sigma=beta_sigma)
 
                     if non_centered:
                         V_genus_raw = pm.Normal("V_genus_raw", mu=0, sigma=1, dims=("genus", "latent_factor"))
@@ -293,6 +284,19 @@ class Hybrid_PMF:
                     V_strains = pm.Normal("V_strains", mu=V_mu,
                                           sigma=v_strains_sigma, dims=("strain", "latent_factor"))
 
+                # --- Calculate Interaction Likelihood ---
+                # 1. Gather the relevant parameters for the observed data points
+                U_obs = U[pep_idx_]  # Shape (N_obs, K)
+                V_obs = V_strains[strain_idx_]  # Shape (N_obs, K)
+
+                # 2. Calculate interaction term using batched dot product along the K dimension
+                interaction = pt.batched_dot(U_obs, V_obs)
+            else:
+                if anchor_pc:
+                    print("Warning: anchor_pc=True has no effect in linear model (no interaction).")
+                # Use pep_idx_.shape[0] to get the size of the tensor
+                interaction = pt.zeros(pep_idx_.shape[0])
+
             # --- INTERCEPTS ---
             ## global_mu removed to avoid centering issue (where sampler can add to mu and subtract elsewhere)
             ## required that I subtract the mean from the dataset before inputting
@@ -318,17 +322,15 @@ class Hybrid_PMF:
                 beta_mu = 0
 
             if non_centered:
-                # 1. Sample raw from a standard normal
+                # Sample strain intercept from a standard normal
                 beta_strain_raw = pm.Normal("beta_strain_raw", mu=0, sigma=1, dims="strain")
-                # 2. Scale it deterministically
+                # Scale it deterministically
                 beta_strain = pm.Deterministic("beta_strain", beta_mu + beta_strain_raw * beta_strain_sigma,
                                                dims="strain")
             elif hierarchical:
-                beta_strain = pm.Normal("beta_strain", mu=beta_mu,
-                                        dims="strain", sigma=beta_strain_sigma)
+                beta_strain = pm.Normal("beta_strain", mu=beta_mu, sigma=beta_strain_sigma, dims="strain")
             else:
-                beta_strain = pm.ZeroSumNormal("beta_strain",
-                                               dims="strain", sigma=beta_strain_sigma)
+                beta_strain = pm.ZeroSumNormal("beta_strain", sigma=beta_strain_sigma, dims="strain")
 
             # Peptide Intercept (Cold-start friendly mapping)
             w0_pc_sigma = pm.HalfNormal("w0_pc_sigma", sigma=1.0)
@@ -336,37 +338,7 @@ class Hybrid_PMF:
 
             if use_esm_intercept:
                 if horseshoe_intercept:
-                    # # 2. ESM Features (COLUMN-WISE HORSESHOE PRIOR - Non-Centered)
-                    # # Global shrinkage
-                    # tau_esm = pm.HalfCauchy("tau_esm", beta=1)
-                    # # Local shrinkage (One per ESM feature, applied across all K dims)
-                    # lambda_esm = pm.HalfCauchy("lambda_esm", beta=1, dims="esm")
-
-                    # 1. Global Shrinkage (tau) - heavily squashed based on 1280 features
-                    # Expecting only ~15 relevant features out of 1280
-                    D = X_esm_intercept.shape[1]  # 1280
-                    tau_0 = esm_active_num / (D - esm_active_num)
-                    tau_esm_int = pm.HalfNormal("tau_esm_int", sigma=tau_0)
-
-                    # 2. Local Shrinkage (lambda) - Heavy tails to let signals escape
-                    lambda_esm_int = pm.HalfCauchy("lambda_esm_int", beta=1, dims="esm_intercept")
-
-                    # 3. The Slab (c2) - This prevents the escaping signals from going to infinity
-                    # Regularizes the tails so NUTS doesn't crash
-                    c2_int = pm.InverseGamma("c2_int", alpha=1.5, beta=1.5 * slab_scale ** 2)
-
-                    # 4. Calculate the Regularized local shrinkage
-                    lambda_tilde_int = pt.sqrt((c2_int * lambda_esm_int ** 2) / (c2_int + tau_esm_int ** 2 * lambda_esm_int ** 2))
-
-                    # 5. Non-centered raw weights
-                    w0_esm_raw = pm.Normal("w0_esm_raw", mu=0, sigma=1, dims="esm_intercept")
-
-                    # 6. Final Weights
-                    w0_esm = pm.Deterministic(
-                        "w0_esm",
-                        w0_esm_raw * (tau_esm_int * lambda_tilde_int),
-                        dims="esm_intercept"
-                    )
+                    w0_esm = self._horseshoe(X_esm_intercept, esm_active_num, slab_scale, intercept=True)
                 else:
                     w0_esm_sigma = pm.HalfNormal("w0_esm_sigma", sigma=1.0)
                     w0_esm = pm.Normal("w0_esm", mu=0, sigma=w0_esm_sigma, dims="esm_intercept")
@@ -376,30 +348,62 @@ class Hybrid_PMF:
                 alpha_peptide = pm.Deterministic("alpha_peptide", pt.dot(X_pc, w0_pc),
                                                  dims="peptide")
 
-            # --- LIKELIHOOD ---
-            if not linreg:
-                # 1. Gather the relevant parameters for the observed data points
-                U_obs = U[pep_idx_]  # Shape (N_obs, K)
-                V_obs = V_strains[strain_idx_]  # Shape (N_obs, K)
-
-                # 2. Calculate interaction term using batched dot product along the K dimension
-                interaction = pt.batched_dot(U_obs, V_obs)
-            else:
-                # Use pep_idx_.shape[0] to get the size of the tensor
-                interaction = pt.zeros(pep_idx_.shape[0])
-
-            # 3. Build the predicted mean
+            # Add together the intercepts and interaction terms (if using)
+            # Predicted mean for each observation based on peptide and strain indices
             mu_obs = pm.Deterministic("mu_obs", alpha_peptide[pep_idx_] + beta_strain[strain_idx_] + interaction,  # + global_mu,
                                       dims="obs_id")
 
-            # 4. Observation Noise
+            # Learn the observation noise (primarily from repeated measurements for same pairing
             sigma_obs = pm.HalfNormal("sigma_obs", sigma=sigma_obs_sigma)
 
-            # 5. Final Distribution
+            # Final MIC Distribution
             pm.Normal("MIC_obs", mu=mu_obs, sigma=sigma_obs, observed=mic_, dims="obs_id")
 
         self.model = pmf
         logging.info("Done building the PMF model.")
+
+    def _horseshoe(self, X_esm, esm_active_num, slab_scale, intercept=True):
+        if intercept:
+            name_suffix = "_int"
+            dim = "esm_intercept"
+            full_dims = dim
+            output_name = "w0_esm"
+        else:
+            name_suffix = ""
+            dim = "esm_interaction"
+            full_dims = (dim, "latent_factor")
+            output_name = "B_esm"
+
+        # 1. Global Shrinkage (tau) - heavily squashed based on 1280 features
+        # Expecting only ~15 relevant features out of 1280
+        D = X_esm.shape[1]  # 1280
+        tau_0 = esm_active_num / (D - esm_active_num)
+        tau_esm = pm.HalfNormal(f"tau_esm{name_suffix}", sigma=tau_0)  # tau_esm
+
+        # 2. Local Shrinkage (lambda) - Heavy tails to let signals escape
+        lambda_esm = pm.HalfCauchy(f"lambda_esm{name_suffix}", beta=1, dims=dim)
+
+        # 3. The Slab (c2) - This prevents the escaping signals from going to infinity
+        # Regularizes the tails so NUTS doesn't crash
+        c2 = pm.InverseGamma("c2", alpha=1.5, beta=1.5 * slab_scale ** 2)
+
+        # 4. Calculate the Regularized local shrinkage
+        lambda_tilde = pt.sqrt((c2 * lambda_esm ** 2) / (c2 + tau_esm ** 2 * lambda_esm ** 2))
+
+        # 5. Non-centered raw weights
+        esm_raw = pm.Normal("esm_raw", mu=0, sigma=1, dims=full_dims)
+
+        # 6. Final Weights
+        calculation = esm_raw * (tau_esm * lambda_tilde)
+        if not intercept:
+            calculation = calculation[:, None]
+        esm = pm.Deterministic(
+            output_name,
+            calculation,
+            dims=full_dims
+        )
+
+        return esm
 
     # Draw MCMC samples.
     def draw_samples(self, **kwargs):

@@ -140,6 +140,7 @@ class Hybrid_PMF:
             self.esm_intercept_df = esm_intercept
             esm_intercept_input = esm_intercept.loc[unique_pep_idx].iloc[:, :-1].values
         else:
+            self.esm_intercept_df = None
             esm_intercept_input = None
 
         if use_esm_interaction:
@@ -148,6 +149,7 @@ class Hybrid_PMF:
             self.esm_interaction_df = esm_interaction
             esm_interaction_input = esm_interaction.loc[unique_pep_idx].iloc[:, :-1].values
         else:
+            self.esm_interaction_df = None
             esm_interaction_input = None
 
         n_peptides = len(np.unique(obs_peptide_idx))
@@ -397,11 +399,7 @@ class Hybrid_PMF:
         calculation = esm_raw * (tau_esm * lambda_tilde)
         if not intercept:
             calculation = calculation[:, None]
-        esm = pm.Deterministic(
-            output_name,
-            calculation,
-            dims=full_dims
-        )
+        esm = pm.Deterministic(output_name, calculation, dims=full_dims)
 
         return esm
 
@@ -425,25 +423,31 @@ class Hybrid_PMF:
         return self.idata_vi
 
     def predict_new_peptides(self, new_long_df, return_full_posterior=False, var_names=None):
-        # 1. Identify the unique peptides in this specific prediction batch
+        # TODO what to do if random_effects (for new peptides??)
+        # Identify the unique peptides in this specific prediction batch
         predict_peps = new_long_df["Peptide ID"].unique()
 
-        # 2. Extract their features from your master dataframes
-        # Assumes original_idx is a column containing the Peptide IDs
-        pc_df_predict = self.pc_df[self.pc_df['original_idx'].isin(predict_peps)]
-        esm_df_predict = self.esm_df[self.esm_df['original_idx'].isin(predict_peps)]
-
-        # 3. Create a LOCAL dictionary mapping to 0, 1, 2... N
-        # This prevents the PyMC IndexError trap
+        # Create a LOCAL dictionary mapping to 0, 1, 2... N
         local_pep_dict = {pep: i for i, pep in enumerate(predict_peps)}
 
-        # 4. Map the observation dataframe to these local indices
+        # Map the observation dataframe to these local indices
         obs_peptide_idx = new_long_df["Peptide ID"].map(local_pep_dict).values
 
-        # 5. Extract feature matrices in the exact order of the local dictionary
-        # Make sure to set the index to Peptide ID temporarily so .loc alignment works perfectly
+        # Extract their features from master dataframes and set to order of the local dictionary
+        # Assumes original_idx is a column containing the Peptide IDs
+        pc_df_predict = self.pc_df[self.pc_df['original_idx'].isin(predict_peps)]
         pc_input = pc_df_predict.set_index('original_idx').loc[predict_peps]
-        esm_input = esm_df_predict.set_index('original_idx').loc[predict_peps]
+        if self.esm_intercept_df is not None:
+            esm_intercept_predict = self.esm_intercept_df[self.esm_intercept_df['original_idx'].isin(predict_peps)]
+            esm_intercept_input = esm_intercept_predict.set_index('original_idx').loc[predict_peps]
+        else:
+            esm_intercept_input = None
+
+        if self.esm_interaction_df is not None:
+            esm_interaction_predict = self.esm_interaction_df[self.esm_interaction_df['original_idx'].isin(predict_peps)]
+            esm_interaction_input = esm_interaction_predict.set_index('original_idx').loc[predict_peps]
+        else:
+            esm_interaction_input = None
 
         # Ensure all target species exist in the training dictionary
         assert len(set(new_long_df["Target Species"]) - set(self.strain_dict.keys())) == 0, \
@@ -458,7 +462,8 @@ class Hybrid_PMF:
                     "strain_idx": obs_strain_idx,
                     "mic": np.ones(len(new_long_df)),  # Dummy values for shape
                     "X_pc": pc_input.values,
-                    "X_esm": esm_input.values,
+                    "X_esm_intercept": esm_intercept_input.values,
+                    "X_esm_interaction": esm_interaction_input.values,
                 },
                 coords={
                     "obs_id": range(len(new_long_df)),

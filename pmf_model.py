@@ -12,6 +12,7 @@ import xarray as xr
 import scipy.stats as stats
 from scipy.stats import norm
 from scipy.special import logsumexp
+from sklearn.neighbors import NearestNeighbors
 import pymc as pm
 import pytensor.tensor as pt
 import numpy as np
@@ -422,8 +423,13 @@ class Hybrid_PMF:
             self.idata_vi = pm.fit(**kwargs)
         return self.idata_vi
 
-    def predict_new_peptides(self, new_long_df, return_full_posterior=False, var_names=None):
-        # TODO what to do if random_effects (for new peptides??)
+    def predict_new_peptides(self, new_long_df, return_full_posterior=False, var_names=None,
+                             new_peptide_method="knn", k=10):
+        """
+        Predicts MICs for a new dataset.
+        :param new_peptide_method: "knn" or "marginal". Determines how to handle unseen peptides.
+        :param k: Number of neighbors to use if method is "knn".
+        """
         # Identify the unique peptides in this specific prediction batch
         predict_peps = new_long_df["Peptide ID"].unique()
 
@@ -434,18 +440,21 @@ class Hybrid_PMF:
         obs_peptide_idx = new_long_df["Peptide ID"].map(local_pep_dict).values
 
         # Extract their features from master dataframes and set to order of the local dictionary
-        # Assumes original_idx is a column containing the Peptide IDs
         pc_df_predict = self.pc_df[self.pc_df['original_idx'].isin(predict_peps)]
-        pc_input = pc_df_predict.set_index('original_idx').loc[predict_peps].values
+        # Note: Using .select_dtypes to safely drop 'original_idx' and avoid string columns
+        pc_input = pc_df_predict.set_index('original_idx').loc[predict_peps].select_dtypes(include=[np.number]).values
 
         esm_data_dict = {}
-        if self.esm_intercept_df is not None:
+        if getattr(self, "esm_intercept_df", None) is not None:
             esm_intercept_predict = self.esm_intercept_df[self.esm_intercept_df['original_idx'].isin(predict_peps)]
-            esm_data_dict["X_esm_intercept"] = esm_intercept_predict.set_index('original_idx').loc[predict_peps].values
+            esm_data_dict["X_esm_intercept"] = esm_intercept_predict.set_index('original_idx').loc[
+                predict_peps].select_dtypes(include=[np.number]).values
 
-        if self.esm_interaction_df is not None:
-            esm_interaction_predict = self.esm_interaction_df[self.esm_interaction_df['original_idx'].isin(predict_peps)]
-            esm_data_dict["X_esm_interaction"] = esm_interaction_predict.set_index('original_idx').loc[predict_peps].values
+        if getattr(self, "esm_interaction_df", None) is not None:
+            esm_interaction_predict = self.esm_interaction_df[
+                self.esm_interaction_df['original_idx'].isin(predict_peps)]
+            esm_data_dict["X_esm_interaction"] = esm_interaction_predict.set_index('original_idx').loc[
+                predict_peps].select_dtypes(include=[np.number]).values
 
         # Ensure all target species exist in the training dictionary
         assert len(set(new_long_df["Target Species"]) - set(self.strain_dict.keys())) == 0, \
@@ -456,8 +465,15 @@ class Hybrid_PMF:
         with self.model:
             idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
 
-            # if self.param_inputs["random_effects"]:
-            #     idata.posterior = self.gen_peptides_U()
+            # We must NOT modify the master idata in-place during predictions
+            idata_mod = idata.copy()
+
+            # If U is treated as free parameters (random effects)
+            if self.param_inputs.get("random_effects", False):
+                # Pass the method choices down and replace the posterior in the copy
+                idata_mod.posterior = self.gen_peptides_U(
+                    idata_mod, predict_peps, new_peptide_method=new_peptide_method, k=k
+                )
 
             pm.set_data(
                 {
@@ -473,42 +489,88 @@ class Hybrid_PMF:
                 },
             )
 
-            ppc = pm.sample_posterior_predictive(idata, extend_inferencedata=False, var_names=var_names)
+            ppc = pm.sample_posterior_predictive(idata_mod, extend_inferencedata=False, var_names=var_names)
 
         # if no var_names given, just return the final observations: MIC_obs
         var_names = ["MIC_obs"] if var_names is None else var_names
         raw = ppc.posterior_predictive[var_names]
         return raw if return_full_posterior else raw.mean(("chain", "draw"))
 
-        # u_mean = self.idata.posterior["U"].mean(dim="peptide")
-        # post = self.idata.posterior
-        #
-        # obs_strain_idx = new_long_df["Target Species"].map(self.strain_dict).values
-        #
-        # X_pc_new = xr.DataArray(pc_input.values, dims=("peptide_new", "phys_chem"))
-        #
-        # alpha_new = xr.dot(X_pc_new, post["w0_pc"], dims="phys_chem")
-        #
-        # # get features
-        # obs_strain_idx = new_long_df["Target Species"].map(self.strain_dict).values
-        #
-        # X_esm_new = xr.DataArray(esm_input.values, dims=("peptide_new", "esm"))
-        # alpha_new = alpha_new + xr.dot(X_esm_new, post["w0_esm"], dims="esm")
-        #
-        # # new alpha from calculation and beta from sample
-        # alpha_obs = alpha_new.isel(peptide_new=obs_peptide_idx).rename({"peptide_new": "obs_id"})
-        # beta_obs = post["beta_strain"].isel(strain=obs_strain_idx).rename({"strain": "obs_id"})
-        #
-        # # mean u, post v
-        # u_mean = post["U"].mean(dim="peptide")
-        # v_obs = post["V"].isel(strain=obs_strain_idx).rename({"strain": "obs_id"})
-        #
-        # interaction = (u_mean * v_obs).sum(dim="latent_factor")
-        #
-        # mu = alpha_obs + beta_obs + interaction
-        #
-        # # take mean of chain samples
-        # return mu.mean(dim=("chain", "draw")).values
+    def gen_peptides_U(self, idata, predict_peps, new_peptide_method="knn", k=10):
+        post = idata.posterior.copy()
+
+        # Sort training peptides explicitly by their integer ID (0...N_train-1)
+        # This guarantees that row i in X_train equals peptide=i in post["U"]
+        train_peps_sorted = sorted(self.peptide_dict.keys(), key=lambda x: self.peptide_dict[x])
+        new_peps = [p for p in predict_peps if p not in self.peptide_dict]
+
+        # Pre-calculate the global marginal just in case (and for the 'marginal' method)
+        U_marginal_all = post["U"].mean(dim="peptide")
+
+        new_pep_U_dict = {}
+
+        if new_peptide_method == "knn" and len(new_peps) > 0:
+
+            # Helper function to safely extract combined features for a list of string IDs
+            def get_features(pep_list):
+                feat_arrays = []
+                feat_arrays.append(
+                    self.pc_df.set_index('original_idx').loc[pep_list].select_dtypes(include=[np.number]).values)
+                if getattr(self, "esm_intercept_df", None) is not None:
+                    feat_arrays.append(self.esm_intercept_df.set_index('original_idx').loc[pep_list].select_dtypes(
+                        include=[np.number]).values)
+                if getattr(self, "esm_interaction_df", None) is not None:
+                    feat_arrays.append(self.esm_interaction_df.set_index('original_idx').loc[pep_list].select_dtypes(
+                        include=[np.number]).values)
+                return np.hstack(feat_arrays)
+
+            # 1. Build and scale feature arrays
+            X_train = get_features(train_peps_sorted)
+            X_new = get_features(new_peps)
+
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_new_scaled = scaler.transform(X_new)
+
+            # 2. k-Nearest Neighbors Search (Vectorized for all new peptides at once)
+            # Protect against asking for more neighbors than training samples
+            k_safe = min(k, len(train_peps_sorted))
+            knn = NearestNeighbors(n_neighbors=k_safe, metric='cosine')
+            knn.fit(X_train_scaled)
+
+            # Indices shape: (len(new_peps), k_safe)
+            _, knn_indices = knn.kneighbors(X_new_scaled)
+
+            # 3. Calculate marginalized U for each new peptide
+            for i, new_pep in enumerate(new_peps):
+                # knn_indices[i] maps perfectly to the 'peptide' dim in post["U"]
+                # because we sorted X_train by self.peptide_dict earlier
+                neighbor_indices = knn_indices[i]
+                U_neighbors = post["U"].isel(peptide=neighbor_indices)
+                new_pep_U_dict[new_pep] = U_neighbors.mean(dim="peptide")
+
+        # Assemble the final U posterior exactly mapped to the local 0...N coordinates
+        U_list = []
+        for local_idx, pep in enumerate(predict_peps):
+            if pep in self.peptide_dict:
+                # Old peptide: grab its learned U
+                train_idx = self.peptide_dict[pep]
+                U_pep = post["U"].isel(peptide=train_idx)
+            else:
+                # New peptide: grab KNN marginal or global marginal
+                if new_peptide_method == "knn":
+                    U_pep = new_pep_U_dict[pep]
+                else:
+                    U_pep = U_marginal_all
+
+            # Expand dims so xarray knows this is peptide 'local_idx'
+            U_pep = U_pep.expand_dims({"peptide": [local_idx]})
+            U_list.append(U_pep)
+
+        # Concatenate all to form the completely remapped post["U"]
+        post["U"] = xr.concat(U_list, dim="peptide")
+
+        return post
 
     def evaluate(self, test_df, label=""):
         # check for MCMC first
@@ -516,10 +578,10 @@ class Hybrid_PMF:
         y_true = test_df["mic"].values
         return compute_metrics(y_true, y_pred, label=label)
 
-    def get_HDI_coverage(self, test_df, hdi_prob=0.94):
+    def get_HDI_coverage(self, test_df, hdi_prob=0.94, new_peptide_method="knn", k=10):
         # 1. Get the FULL matrix of posterior predictions
         # Shape will be (chains, draws, n_test_observations)
-        posterior_preds_xr = self.predict_new_peptides(test_df, return_full_posterior=True)
+        posterior_preds_xr = self.predict_new_peptides(test_df, return_full_posterior=True, new_peptide_method=new_peptide_method, k=k)
 
         # 2. Calculate the HDI for every single test observation
         # az.hdi returns an array of shape (n_test_observations, 2) containing [lower_bound, upper_bound]
@@ -533,11 +595,11 @@ class Hybrid_PMF:
 
         return coverage_pct
 
-    def get_elpd_test(self, test_df, var_names=None):
+    def get_elpd_test(self, test_df, var_names=None, new_peptide_method="knn", k=10):
 
         y_true = test_df["mic"].values
         posterior_preds_xr = self.predict_new_peptides(test_df, return_full_posterior=True,
-                                                  var_names=var_names)
+                                                  var_names=var_names, new_peptide_method=new_peptide_method, k=k)
 
 
         mu_test_samples = posterior_preds_xr["mu_obs"].stack(sample=("chain", "draw")).values.T
@@ -555,7 +617,7 @@ class Hybrid_PMF:
         total_test_elpd = test_point_elpd.sum()
         return total_test_elpd, test_point_elpd
 
-    def full_evaluation(self, test_df):
+    def full_evaluation(self, test_df, new_peptide_method="knn", k=10):
         """
         on the training data (save for each value)
         -run LOO-CV
@@ -574,7 +636,7 @@ class Hybrid_PMF:
 
         train_loo_cv_vals = az.loo(self.idata).loo_i.values
 
-        y_pred_train = self.predict_new_peptides(self.obs_df, return_full_posterior=True).mean(("chain", "draw")).MIC_obs.values
+        y_pred_train = self.predict_new_peptides(self.obs_df, return_full_posterior=True, new_peptide_method=new_peptide_method, k=k).mean(("chain", "draw")).MIC_obs.values
         y_true_train = self.obs_df["mic"].values
         error_train = y_true_train - y_pred_train
         rmse_train = np.sqrt(np.mean(error_train ** 2))
@@ -584,13 +646,13 @@ class Hybrid_PMF:
         train_data['error'] = error_train
 
         # test data
-        y_pred = self.predict_new_peptides(test_df, return_full_posterior=True).mean(
+        y_pred = self.predict_new_peptides(test_df, return_full_posterior=True, new_peptide_method=new_peptide_method, k=k).mean(
             ("chain", "draw")).MIC_obs.values
         y_true = test_df["mic"].values
         error = y_true - y_pred
         rmse = np.sqrt(np.mean(error ** 2))
 
-        total_test_elpd, test_point_elpd = self.get_elpd_test(test_df, var_names=["mu_obs", "sigma_obs"])
+        total_test_elpd, test_point_elpd = self.get_elpd_test(test_df, var_names=["mu_obs", "sigma_obs"], new_peptide_method=new_peptide_method, k=k)
 
         test_df['elpd'] = test_point_elpd
         test_df['error'] = error

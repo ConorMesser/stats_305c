@@ -207,7 +207,7 @@ class Hybrid_PMF:
                     if non_centered:
                         U_raw = pm.Normal("U_raw", mu=0,
                                                   sigma=1, dims=("peptide", "latent_factor"))
-                        U = pm.Deterministic("V_strains", U_raw * sigma_u,
+                        U = pm.Deterministic("U", U_raw * sigma_u,
                                                      dims=("peptide", "latent_factor"))
                     else:
                         U = pm.Normal("U", mu=0, sigma=sigma_u, dims=("peptide", "latent_factor"))
@@ -454,6 +454,11 @@ class Hybrid_PMF:
         obs_strain_idx = new_long_df["Target Species"].map(self.strain_dict).values
 
         with self.model:
+            idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
+
+            # if self.param_inputs["random_effects"]:
+            #     idata.posterior = self.gen_peptides_U()
+
             pm.set_data(
                 {
                     "pep_idx": obs_peptide_idx,
@@ -468,13 +473,42 @@ class Hybrid_PMF:
                 },
             )
 
-            idata = self.idata if hasattr(self, 'idata') and self.idata else self.idata_vi
             ppc = pm.sample_posterior_predictive(idata, extend_inferencedata=False, var_names=var_names)
 
         # if no var_names given, just return the final observations: MIC_obs
         var_names = ["MIC_obs"] if var_names is None else var_names
         raw = ppc.posterior_predictive[var_names]
         return raw if return_full_posterior else raw.mean(("chain", "draw"))
+
+        # u_mean = self.idata.posterior["U"].mean(dim="peptide")
+        # post = self.idata.posterior
+        #
+        # obs_strain_idx = new_long_df["Target Species"].map(self.strain_dict).values
+        #
+        # X_pc_new = xr.DataArray(pc_input.values, dims=("peptide_new", "phys_chem"))
+        #
+        # alpha_new = xr.dot(X_pc_new, post["w0_pc"], dims="phys_chem")
+        #
+        # # get features
+        # obs_strain_idx = new_long_df["Target Species"].map(self.strain_dict).values
+        #
+        # X_esm_new = xr.DataArray(esm_input.values, dims=("peptide_new", "esm"))
+        # alpha_new = alpha_new + xr.dot(X_esm_new, post["w0_esm"], dims="esm")
+        #
+        # # new alpha from calculation and beta from sample
+        # alpha_obs = alpha_new.isel(peptide_new=obs_peptide_idx).rename({"peptide_new": "obs_id"})
+        # beta_obs = post["beta_strain"].isel(strain=obs_strain_idx).rename({"strain": "obs_id"})
+        #
+        # # mean u, post v
+        # u_mean = post["U"].mean(dim="peptide")
+        # v_obs = post["V"].isel(strain=obs_strain_idx).rename({"strain": "obs_id"})
+        #
+        # interaction = (u_mean * v_obs).sum(dim="latent_factor")
+        #
+        # mu = alpha_obs + beta_obs + interaction
+        #
+        # # take mean of chain samples
+        # return mu.mean(dim=("chain", "draw")).values
 
     def evaluate(self, test_df, label=""):
         # check for MCMC first

@@ -638,6 +638,8 @@ class Hybrid_PMF:
         train_data = self.obs_df.copy()
         train_data['error'] = error_train
 
+        output_dict = dict(rmse_train=rmse_train)
+
         if compute_elpd:
             if 'log_likelihood' not in self.idata.keys() or len(self.idata.log_likelihood) == 0:
                 with self.model:
@@ -645,6 +647,7 @@ class Hybrid_PMF:
 
             train_loo_cv_vals = az.loo(self.idata).loo_i.values
             train_data['elpd'] = train_loo_cv_vals
+            output_dict['elpd_train'] = train_loo_cv_vals.sum()
 
         # test data
         y_pred = self.predict_new_peptides(test_df, return_full_posterior=True, new_peptide_method=new_peptide_method, k=k).mean(
@@ -653,14 +656,16 @@ class Hybrid_PMF:
         error = y_true - y_pred
         rmse = np.sqrt(np.mean(error ** 2))
 
-        total_test_elpd, test_point_elpd = self.get_elpd_test(test_df, var_names=["mu_obs", "sigma_obs"], new_peptide_method=new_peptide_method, k=k)
+        output_dict['rmse'] = rmse
 
         test_df['error'] = error
         if compute_elpd:
+            total_test_elpd, test_point_elpd = self.get_elpd_test(test_df, var_names=["mu_obs", "sigma_obs"],
+                                                                  new_peptide_method=new_peptide_method, k=k)
             test_df['elpd'] = test_point_elpd
+            output_dict['elpd_test'] = total_test_elpd
 
-        return train_data, test_df, dict(rmse_train=rmse_train, rmse_test=rmse,
-                                         elpd_train=train_loo_cv_vals.sum(), elpd_test=total_test_elpd)
+        return train_data, test_df, output_dict
 
 
     def _norms(self):

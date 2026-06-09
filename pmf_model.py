@@ -617,7 +617,7 @@ class Hybrid_PMF:
         total_test_elpd = test_point_elpd.sum()
         return total_test_elpd, test_point_elpd
 
-    def full_evaluation(self, test_df, new_peptide_method="knn", k=10):
+    def full_evaluation(self, test_df, new_peptide_method="knn", k=10, compute_elpd=True):
         """
         on the training data (save for each value)
         -run LOO-CV
@@ -630,20 +630,21 @@ class Hybrid_PMF:
         Calculate HDI - 94%
         """
         # training data
-        if 'log_likelihood' not in self.idata.keys() or len(self.idata.log_likelihood) == 0:
-            with self.model:
-                pm.compute_log_likelihood(self.idata)
-
-        train_loo_cv_vals = az.loo(self.idata).loo_i.values
-
         y_pred_train = self.predict_new_peptides(self.obs_df, return_full_posterior=True, new_peptide_method=new_peptide_method, k=k).mean(("chain", "draw")).MIC_obs.values
         y_true_train = self.obs_df["mic"].values
         error_train = y_true_train - y_pred_train
         rmse_train = np.sqrt(np.mean(error_train ** 2))
 
         train_data = self.obs_df.copy()
-        train_data['elpd'] = train_loo_cv_vals
         train_data['error'] = error_train
+
+        if compute_elpd:
+            if 'log_likelihood' not in self.idata.keys() or len(self.idata.log_likelihood) == 0:
+                with self.model:
+                    pm.compute_log_likelihood(self.idata)
+
+            train_loo_cv_vals = az.loo(self.idata).loo_i.values
+            train_data['elpd'] = train_loo_cv_vals
 
         # test data
         y_pred = self.predict_new_peptides(test_df, return_full_posterior=True, new_peptide_method=new_peptide_method, k=k).mean(
@@ -654,8 +655,9 @@ class Hybrid_PMF:
 
         total_test_elpd, test_point_elpd = self.get_elpd_test(test_df, var_names=["mu_obs", "sigma_obs"], new_peptide_method=new_peptide_method, k=k)
 
-        test_df['elpd'] = test_point_elpd
         test_df['error'] = error
+        if compute_elpd:
+            test_df['elpd'] = test_point_elpd
 
         return train_data, test_df, dict(rmse_train=rmse_train, rmse_test=rmse,
                                          elpd_train=train_loo_cv_vals.sum(), elpd_test=total_test_elpd)
